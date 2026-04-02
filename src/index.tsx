@@ -11,6 +11,284 @@ app.use('/api/*', cors())
 app.use('/static/*', serveStatic({ root: './' }))
 
 // =============================
+// 協会けんぽ スクレイピングAPI
+// =============================
+
+app.get('/api/kyoukaikenpo', async (c) => {
+  const keyword = (c.req.query('keyword') || '').toLowerCase()
+  try {
+    const urls = [
+      'https://www.kyoukaikenpo.or.jp/disclosure/procurement/',
+    ]
+    // アーカイブページも含める場合 (オプション)
+    const includeArchive = c.req.query('includeArchive') === '1'
+    if (includeArchive) {
+      urls.push('https://www.kyoukaikenpo.or.jp/disclosure/procurement/r07')
+    }
+
+    const allItems: any[] = []
+    for (const url of urls) {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'BidSearchApp/1.0 (+https://github.com/bid-search)' }
+      })
+      if (!res.ok) continue
+      const html = await res.text()
+      const items = scrapeKyoukaikenpo(html, url)
+      allItems.push(...items)
+    }
+
+    // キーワードフィルター
+    const filtered = keyword
+      ? allItems.filter(i =>
+          i.projectName.toLowerCase().includes(keyword) ||
+          (i.procedureType && i.procedureType.toLowerCase().includes(keyword))
+        )
+      : allItems
+
+    return c.json({ source: '協会けんぽ', totalHits: filtered.length, items: filtered })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+function scrapeKyoukaikenpo(html: string, baseUrl: string): any[] {
+  const items: any[] = []
+  // セクション（公開中の各入札種別）を抽出
+  // h3タグ → その後のtable内のtrを処理
+  const sectionRegex = /<h3[^>]*>(.*?)<\/h3>([\s\S]*?)(?=<h3|<h2|$)/gi
+  let secMatch
+  while ((secMatch = sectionRegex.exec(html)) !== null) {
+    const sectionName = secMatch[1].replace(/<[^>]+>/g, '').trim()
+    const sectionHtml = secMatch[2]
+
+    // テーブル行を抽出
+    const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi
+    let rowMatch
+    while ((rowMatch = rowRegex.exec(sectionHtml)) !== null) {
+      const row = rowMatch[1]
+      // td抽出
+      const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi
+      const tds: string[] = []
+      let tdMatch
+      while ((tdMatch = tdRegex.exec(row)) !== null) {
+        tds.push(tdMatch[1])
+      }
+      if (tds.length < 2) continue
+
+      // 日付 (td[0])
+      const dateRaw = tds[0].replace(/<[^>]+>/g, '').trim()
+      const dateIso = convertJapaneseDate(dateRaw)
+
+      // 案件名とリンク (td[1])
+      const linkMatch = tds[1].match(/<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i)
+      if (!linkMatch) continue
+      let href = linkMatch[1]
+      const name = linkMatch[2].replace(/<[^>]+>/g, '').trim()
+      if (!name) continue
+
+      // 絶対URLに変換
+      if (href.startsWith('/')) {
+        href = 'https://www.kyoukaikenpo.or.jp' + href
+      } else if (!href.startsWith('http')) {
+        href = baseUrl.replace(/\/[^/]*$/, '/') + href
+      }
+
+      items.push({
+        source: '協会けんぽ',
+        organizationName: '全国健康保険協会（協会けんぽ）',
+        projectName: name,
+        procedureType: sectionName,
+        cftIssueDate: dateIso,
+        url: href,
+        prefectureName: '東京都',
+        category: '役務',
+      })
+    }
+  }
+  return items
+}
+
+// =============================
+// 企業年金連合会 スクレイピングAPI
+// =============================
+
+app.get('/api/pfa', async (c) => {
+  const keyword = (c.req.query('keyword') || '').toLowerCase()
+  try {
+    const res = await fetch('https://www.pfa.or.jp/chotatsu/ichiran/index.html', {
+      headers: { 'User-Agent': 'BidSearchApp/1.0' }
+    })
+    if (!res.ok) {
+      return c.json({ error: `取得失敗: ${res.status}` }, 500)
+    }
+    const html = await res.text()
+    let items = scrapePfa(html)
+
+    if (keyword) {
+      items = items.filter(i => i.projectName.toLowerCase().includes(keyword))
+    }
+
+    return c.json({ source: '企業年金連合会', totalHits: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+function scrapePfa(html: string): any[] {
+  const items: any[] = []
+  // 「日付 案件名 [PDF/ZIP リンク群]」のパターン
+  // li要素または段落ごとに処理
+  // パターン: 令和X年Y月Z日 案件名\n  [ZIP][PDF][PDF] の繰り返し
+  const blockRegex = /(令和\d+年\d+月\d+日)\s+([\s\S]*?)(?=令和\d+年\d+月\d+日|$)/g
+  let m
+  while ((m = blockRegex.exec(html)) !== null) {
+    const dateRaw = m[1].trim()
+    const blockContent = m[2]
+
+    // 案件名: blockContentの最初の非タグテキスト
+    const plainText = blockContent.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+    if (!plainText) continue
+
+    // 最初のリンク（PDF優先）をメインURLとする
+    const linkMatches = [...blockContent.matchAll(/<a[^>]+href="([^"]+\.(?:pdf|zip))"[^>]*>\s*(?:<[^>]+>)?\s*(PDF|ZIP)[^<]*(?:<\/[^>]+>)?\s*<\/a>/gi)]
+    // PDFリンクを探す
+    let pdfUrl = ''
+    for (const lm of linkMatches) {
+      const ext = lm[1].toLowerCase()
+      if (ext.endsWith('.pdf') && !ext.endsWith('_r.pdf')) {
+        pdfUrl = lm[1]
+        break
+      }
+    }
+    if (!pdfUrl && linkMatches.length > 0) {
+      pdfUrl = linkMatches[0][1]
+    }
+
+    // 絶対URLに変換
+    if (pdfUrl && pdfUrl.startsWith('files/')) {
+      pdfUrl = 'https://www.pfa.or.jp/chotatsu/ichiran/' + pdfUrl
+    } else if (pdfUrl && pdfUrl.startsWith('/')) {
+      pdfUrl = 'https://www.pfa.or.jp' + pdfUrl
+    }
+
+    const dateIso = convertJapaneseDate(dateRaw)
+
+    // 添付ファイルリスト
+    const attachments: any[] = []
+    for (const lm of linkMatches) {
+      let uri = lm[1]
+      if (uri.startsWith('files/')) uri = 'https://www.pfa.or.jp/chotatsu/ichiran/' + uri
+      else if (uri.startsWith('/')) uri = 'https://www.pfa.or.jp' + uri
+      const label = lm[0].replace(/<[^>]+>/g, '').trim()
+      attachments.push({ name: label || uri.split('/').pop() || uri, uri })
+    }
+
+    items.push({
+      source: '企業年金連合会',
+      organizationName: '企業年金連合会',
+      projectName: plainText.split('PDF')[0].split('ZIP')[0].trim().replace(/\s+/g, ' ').substring(0, 100),
+      procedureType: '一般競争入札',
+      cftIssueDate: dateIso,
+      url: pdfUrl || 'https://www.pfa.or.jp/chotatsu/ichiran/index.html',
+      prefectureName: '東京都',
+      category: '役務',
+      attachments,
+    })
+  }
+  return items
+}
+
+// 日本語和暦→ISO日付変換
+function convertJapaneseDate(dateStr: string): string {
+  const m = dateStr.match(/令和(\d+)年(\d+)月(\d+)日/)
+  if (m) {
+    const year = 2018 + parseInt(m[1])
+    const month = m[2].padStart(2, '0')
+    const day = m[3].padStart(2, '0')
+    return `${year}-${month}-${day}T00:00:00+09:00`
+  }
+  const m2 = dateStr.match(/平成(\d+)年(\d+)月(\d+)日/)
+  if (m2) {
+    const year = 1988 + parseInt(m2[1])
+    const month = m2[2].padStart(2, '0')
+    const day = m2[3].padStart(2, '0')
+    return `${year}-${month}-${day}T00:00:00+09:00`
+  }
+  return dateStr
+}
+
+// =============================
+// 一括検索API（全ソース横断）
+// =============================
+
+app.get('/api/search-all', async (c) => {
+  const keyword = c.req.query('keyword') || ''
+  const sources = (c.req.query('sources') || 'kkj,kyoukaikenpo,pfa').split(',')
+
+  const results: any[] = []
+  const errors: Record<string, string> = {}
+
+  await Promise.allSettled([
+    // 官公需API
+    sources.includes('kkj') ? (async () => {
+      try {
+        const params = new URLSearchParams({ Query: keyword || '入札', Count: '30' })
+        const res = await fetch(`http://www.kkj.go.jp/api/?${params.toString()}`, {
+          headers: { 'User-Agent': 'BidSearchApp/1.0' }
+        })
+        const xml = await res.text()
+        const parsed = parseKkjXml(xml)
+        ;(parsed.items || []).forEach((item: any) => {
+          item.source = '官公需ポータル'
+          results.push(item)
+        })
+      } catch(e) { errors['kkj'] = String(e) }
+    })() : Promise.resolve(),
+
+    // 協会けんぽ
+    sources.includes('kyoukaikenpo') ? (async () => {
+      try {
+        const res = await fetch('https://www.kyoukaikenpo.or.jp/disclosure/procurement/', {
+          headers: { 'User-Agent': 'BidSearchApp/1.0' }
+        })
+        const html = await res.text()
+        const items = scrapeKyoukaikenpo(html, 'https://www.kyoukaikenpo.or.jp/disclosure/procurement/')
+        const kw = keyword.toLowerCase()
+        const filtered = kw ? items.filter(i => i.projectName.toLowerCase().includes(kw)) : items
+        results.push(...filtered)
+      } catch(e) { errors['kyoukaikenpo'] = String(e) }
+    })() : Promise.resolve(),
+
+    // 企業年金連合会
+    sources.includes('pfa') ? (async () => {
+      try {
+        const res = await fetch('https://www.pfa.or.jp/chotatsu/ichiran/index.html', {
+          headers: { 'User-Agent': 'BidSearchApp/1.0' }
+        })
+        const html = await res.text()
+        const items = scrapePfa(html)
+        const kw = keyword.toLowerCase()
+        const filtered = kw ? items.filter(i => i.projectName.toLowerCase().includes(kw)) : items
+        results.push(...filtered)
+      } catch(e) { errors['pfa'] = String(e) }
+    })() : Promise.resolve(),
+  ])
+
+  // 公告日降順でソート
+  results.sort((a, b) => {
+    const da = a.cftIssueDate || ''
+    const db = b.cftIssueDate || ''
+    return db.localeCompare(da)
+  })
+
+  return c.json({
+    totalHits: results.length,
+    items: results,
+    errors: Object.keys(errors).length > 0 ? errors : undefined,
+  })
+})
+
+// =============================
 // 官公需API プロキシエンドポイント
 // =============================
 
@@ -129,6 +407,123 @@ app.get('/api/stats', async (c) => {
     })
   } catch (error) {
     return c.json({ error: 'Stats取得に失敗しました' }, 500)
+  }
+})
+
+// =============================
+// 協会けんぽ 調達情報スクレイピング
+// =============================
+
+// 協会けんぽHTMLパーサー
+function parseKyoukaikenpoHtml(html: string, sourceLabel: string): any[] {
+  const items: any[] = []
+
+  // <h3>タグでセクションを分割（一般競争入札・見積競争・企画競争・公募など）
+  const sectionRegex = /<h3[^>]*>([\s\S]*?)<\/h3>([\s\S]*?)(?=<h3|<h2|$)/gi
+  let secMatch
+  while ((secMatch = sectionRegex.exec(html)) !== null) {
+    const sectionTitle = secMatch[1].replace(/<[^>]+>/g, '').trim()
+    const sectionBody = secMatch[2]
+
+    // テーブル行を抽出
+    const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi
+    let rowMatch
+    while ((rowMatch = rowRegex.exec(sectionBody)) !== null) {
+      const row = rowMatch[1]
+      // td要素を抽出
+      const tds: string[] = []
+      const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi
+      let tdMatch
+      while ((tdMatch = tdRegex.exec(row)) !== null) {
+        tds.push(tdMatch[1])
+      }
+      if (tds.length < 2) continue
+
+      // 公告日セル（1列目）
+      const dateRaw = tds[0].replace(/<[^>]+>/g, '').trim()
+
+      // 案件名セル（2列目）からリンクと件名を抽出
+      const linkRegex = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi
+      let linkMatch
+      while ((linkMatch = linkRegex.exec(tds[1])) !== null) {
+        const href = linkMatch[1]
+        const name = linkMatch[2].replace(/<[^>]+>/g, '').trim()
+        if (!name) continue
+
+        // 絶対URLに変換
+        const url = href.startsWith('http') ? href : `https://www.kyoukaikenpo.or.jp${href}`
+
+        // 和暦→西暦変換
+        const isoDate = wareki2iso(dateRaw)
+
+        items.push({
+          resultId: `kkp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          projectName: name,
+          organizationName: '全国健康保険協会（協会けんぽ）',
+          procedureType: sectionTitle,
+          cftIssueDate: isoDate,
+          url: url,
+          category: '役務',
+          prefectureName: '東京都',
+          source: sourceLabel,
+          attachments: [{ name: '公告PDF', uri: url }],
+        })
+      }
+    }
+  }
+  return items
+}
+
+// 和暦→ISO8601 変換
+function wareki2iso(wareki: string): string {
+  // 例: 令和08年03月23日 → 2026-03-23
+  const m = wareki.match(/令和(\d{1,2})年(\d{1,2})月(\d{1,2})日/)
+  if (m) {
+    const year = 2018 + parseInt(m[1])
+    const month = m[2].padStart(2, '0')
+    const day = m[3].padStart(2, '0')
+    return `${year}-${month}-${day}T00:00:00+09:00`
+  }
+  const m2 = wareki.match(/平成(\d{1,2})年(\d{1,2})月(\d{1,2})日/)
+  if (m2) {
+    const year = 1988 + parseInt(m2[1])
+    const month = m2[2].padStart(2, '0')
+    const day = m2[3].padStart(2, '0')
+    return `${year}-${month}-${day}T00:00:00+09:00`
+  }
+  return wareki
+}
+
+// 協会けんぽ 現在公開中の案件
+app.get('/api/kyoukaikenpo', async (c) => {
+  const archive = c.req.query('archive') || '' // r07, r06, r05 etc.
+
+  try {
+    const url = archive
+      ? `https://www.kyoukaikenpo.or.jp/disclosure/procurement/${archive}`
+      : 'https://www.kyoukaikenpo.or.jp/disclosure/procurement/'
+
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' },
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const html = await res.text()
+
+    const label = archive ? `協会けんぽ (${archive})` : '協会けんぽ (公開中)'
+    const items = parseKyoukaikenpoHtml(html, label)
+
+    // キーワードフィルタ
+    const query = c.req.query('query') || ''
+    const filtered = query
+      ? items.filter(i =>
+          i.projectName.includes(query) ||
+          (i.procedureType || '').includes(query)
+        )
+      : items
+
+    return c.json({ totalHits: filtered.length, items: filtered, source: '協会けんぽ' })
+  } catch (e) {
+    return c.json({ error: String(e), totalHits: 0, items: [] }, 500)
   }
 })
 
@@ -310,6 +705,11 @@ function renderHTML(): string {
     </a>
     <a href="#" onclick="showPage('service')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-service">
       <i class="fas fa-concierge-bell w-4"></i> 役務案件
+    </a>
+    <div class="border-t border-white/20 my-2"></div>
+    <p class="text-xs text-blue-300 px-4 py-1 font-medium uppercase tracking-wider">特定機関</p>
+    <a href="#" onclick="showPage('kyoukaikenpo')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-kyoukaikenpo">
+      <i class="fas fa-heartbeat w-4"></i> 協会けんぽ
     </a>
   </nav>
   <div class="p-4 border-t border-white/20">
@@ -536,6 +936,56 @@ function renderHTML(): string {
       <div id="service-result-area"></div>
     </div>
 
+    <!-- 協会けんぽ専用ページ -->
+    <div id="page-kyoukaikenpo" class="page-content hidden">
+      <!-- ヘッダーカード -->
+      <div class="bg-gradient-to-br from-rose-50 to-pink-50 border border-rose-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-rose-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-heartbeat text-rose-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">全国健康保険協会（協会けんぽ）調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">協会けんぽ公式サイトの調達情報を直接取得します。一般競争入札・見積競争・企画競争・公募の案件を確認できます。</p>
+            <div class="flex flex-wrap gap-2">
+              <a href="https://www.kyoukaikenpo.or.jp/disclosure/procurement/" target="_blank"
+                 class="text-xs bg-white border border-rose-200 text-rose-600 px-3 py-1.5 rounded-lg hover:bg-rose-50 flex items-center gap-1">
+                <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- フィルター -->
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="kkp-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-rose-300"
+              onkeypress="if(event.key==='Enter') loadKyoukaikenpo()">
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-gray-600 mb-1">年度</label>
+            <select id="kkp-archive" class="px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-rose-300">
+              <option value="">令和8年度（公開中）</option>
+              <option value="r07">令和7年度（終了分）</option>
+              <option value="r06">令和6年度（終了分）</option>
+              <option value="r05">令和5年度（終了分）</option>
+            </select>
+          </div>
+          <button onclick="loadKyoukaikenpo()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #e11d48, #be123c);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+
+      <div id="kkp-result-area"></div>
+    </div>
+
   </main>
 </div>
 
@@ -576,7 +1026,8 @@ function showPage(page) {
     new: '新着案件',
     construction: '工事案件',
     goods: '物品案件',
-    service: '役務案件'
+    service: '役務案件',
+    kyoukaikenpo: '協会けんぽ 調達情報'
   };
   document.getElementById('page-title').textContent = titles[page] || page;
 
@@ -591,6 +1042,8 @@ function showPage(page) {
     loadCategoryPage('goods', '1', '物品案件');
   } else if (page === 'service') {
     loadCategoryPage('service', '3', '役務案件');
+  } else if (page === 'kyoukaikenpo') {
+    loadKyoukaikenpo();
   }
 }
 
@@ -813,6 +1266,111 @@ function getCategoryBadge(cat) {
   };
   const cls = map[cat] || 'badge-default';
   return cat ? \`<span class="tag \${cls}">\${escHtml(cat)}</span>\` : '';
+}
+
+// ========================
+// 協会けんぽ
+// ========================
+async function loadKyoukaikenpo() {
+  const area = document.getElementById('kkp-result-area');
+  const query = document.getElementById('kkp-query').value.trim();
+  const archive = document.getElementById('kkp-archive').value;
+
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">協会けんぽから調達情報を取得中...</p></div></div>\`;
+
+  try {
+    const params = {};
+    if (query) params.query = query;
+    if (archive) params.archive = archive;
+
+    const res = await axios.get('/api/kyoukaikenpo', { params });
+    const data = res.data;
+
+    if (!data.items || data.items.length === 0) {
+      area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+        <i class="fas fa-search text-gray-300 text-4xl mb-4"></i>
+        <p class="text-gray-500 text-lg">案件が見つかりませんでした</p>
+      </div>\`;
+      return;
+    }
+
+    // 入札種別でグループ化
+    const groups = {};
+    data.items.forEach(item => {
+      const key = item.procedureType || 'その他';
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(item);
+    });
+
+    const archiveLabel = archive
+      ? ['r07'=>'令和7年度', 'r06'=>'令和6年度', 'r05'=>'令和5年度'][archive] || archive
+      : '令和8年度（公開中）';
+
+    const badgeColors = {
+      '一般競争入札': 'bg-blue-50 text-blue-700 border border-blue-200',
+      '見積競争': 'bg-green-50 text-green-700 border border-green-200',
+      '企画競争': 'bg-purple-50 text-purple-700 border border-purple-200',
+      '公募': 'bg-orange-50 text-orange-700 border border-orange-200',
+    };
+
+    let html = \`<div class="space-y-6">\`;
+
+    for (const [groupName, groupItems] of Object.entries(groups)) {
+      const badgeCls = badgeColors[groupName] || 'bg-gray-50 text-gray-700 border border-gray-200';
+      html += \`
+        <div class="bg-white rounded-2xl shadow-sm border border-gray-100">
+          <div class="p-5 border-b border-gray-100 flex items-center justify-between">
+            <h3 class="font-bold text-gray-800 flex items-center gap-2">
+              <span class="tag \${badgeCls} text-sm px-3 py-1">\${escHtml(groupName)}</span>
+              <span class="text-xs text-gray-500">\${groupItems.length}件</span>
+            </h3>
+          </div>
+          <div class="divide-y divide-gray-50">
+      \`;
+      groupItems.forEach(item => {
+        const issueDate = formatDisplayDate(item.cftIssueDate);
+        const pdfUrl = item.url || '';
+        html += \`
+          <div class="px-5 py-4 hover:bg-rose-50 transition-colors cursor-pointer" onclick='showModal(\${JSON.stringify(item).replace(/'/g, "\\\\'")})'>\`
+          + \`
+            <div class="flex items-start justify-between gap-4">
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2 mb-1">
+                  \${issueDate ? \`<span class="text-xs text-gray-400"><i class="fas fa-calendar mr-1"></i>\${issueDate}</span>\` : ''}
+                </div>
+                <p class="text-sm font-medium text-gray-800 leading-snug hover:text-rose-700">\${escHtml(item.projectName)}</p>
+              </div>
+              <div class="flex items-center gap-2 flex-shrink-0">
+                \${pdfUrl.endsWith('.pdf') ? \`
+                  <a href="\${escHtml(pdfUrl)}" target="_blank" onclick="event.stopPropagation()"
+                     class="text-xs bg-red-50 text-red-600 border border-red-200 px-2.5 py-1 rounded-lg hover:bg-red-100 flex items-center gap-1">
+                    <i class="fas fa-file-pdf"></i> PDF
+                  </a>
+                \` : ''}
+                <i class="fas fa-chevron-right text-gray-300 text-xs"></i>
+              </div>
+            </div>
+          </div>
+        \`;
+      });
+      html += \`</div></div>\`;
+    }
+
+    html += \`</div>
+      <div class="mt-4 text-center text-xs text-gray-400">
+        <i class="fas fa-info-circle mr-1"></i>
+        データ出典: <a href="https://www.kyoukaikenpo.or.jp/disclosure/procurement/" target="_blank" class="text-blue-400 hover:underline">全国健康保険協会 調達情報</a> (\${archiveLabel})
+      </div>
+    \`;
+
+    area.innerHTML = html;
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+      <i class="fas fa-exclamation-triangle text-yellow-500 text-3xl mb-3"></i>
+      <p class="text-gray-600">取得に失敗しました</p>
+      <p class="text-xs text-gray-400 mt-1">\${e.message}</p>
+    </div>\`;
+  }
 }
 
 // ========================
