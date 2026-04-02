@@ -11,104 +11,6 @@ app.use('/api/*', cors())
 app.use('/static/*', serveStatic({ root: './' }))
 
 // =============================
-// 協会けんぽ スクレイピングAPI
-// =============================
-
-app.get('/api/kyoukaikenpo', async (c) => {
-  const keyword = (c.req.query('keyword') || '').toLowerCase()
-  try {
-    const urls = [
-      'https://www.kyoukaikenpo.or.jp/disclosure/procurement/',
-    ]
-    // アーカイブページも含める場合 (オプション)
-    const includeArchive = c.req.query('includeArchive') === '1'
-    if (includeArchive) {
-      urls.push('https://www.kyoukaikenpo.or.jp/disclosure/procurement/r07')
-    }
-
-    const allItems: any[] = []
-    for (const url of urls) {
-      const res = await fetch(url, {
-        headers: { 'User-Agent': 'BidSearchApp/1.0 (+https://github.com/bid-search)' }
-      })
-      if (!res.ok) continue
-      const html = await res.text()
-      const items = scrapeKyoukaikenpo(html, url)
-      allItems.push(...items)
-    }
-
-    // キーワードフィルター
-    const filtered = keyword
-      ? allItems.filter(i =>
-          i.projectName.toLowerCase().includes(keyword) ||
-          (i.procedureType && i.procedureType.toLowerCase().includes(keyword))
-        )
-      : allItems
-
-    return c.json({ source: '協会けんぽ', totalHits: filtered.length, items: filtered })
-  } catch (e) {
-    return c.json({ error: String(e) }, 500)
-  }
-})
-
-function scrapeKyoukaikenpo(html: string, baseUrl: string): any[] {
-  const items: any[] = []
-  // セクション（公開中の各入札種別）を抽出
-  // h3タグ → その後のtable内のtrを処理
-  const sectionRegex = /<h3[^>]*>(.*?)<\/h3>([\s\S]*?)(?=<h3|<h2|$)/gi
-  let secMatch
-  while ((secMatch = sectionRegex.exec(html)) !== null) {
-    const sectionName = secMatch[1].replace(/<[^>]+>/g, '').trim()
-    const sectionHtml = secMatch[2]
-
-    // テーブル行を抽出
-    const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi
-    let rowMatch
-    while ((rowMatch = rowRegex.exec(sectionHtml)) !== null) {
-      const row = rowMatch[1]
-      // td抽出
-      const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi
-      const tds: string[] = []
-      let tdMatch
-      while ((tdMatch = tdRegex.exec(row)) !== null) {
-        tds.push(tdMatch[1])
-      }
-      if (tds.length < 2) continue
-
-      // 日付 (td[0])
-      const dateRaw = tds[0].replace(/<[^>]+>/g, '').trim()
-      const dateIso = convertJapaneseDate(dateRaw)
-
-      // 案件名とリンク (td[1])
-      const linkMatch = tds[1].match(/<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i)
-      if (!linkMatch) continue
-      let href = linkMatch[1]
-      const name = linkMatch[2].replace(/<[^>]+>/g, '').trim()
-      if (!name) continue
-
-      // 絶対URLに変換
-      if (href.startsWith('/')) {
-        href = 'https://www.kyoukaikenpo.or.jp' + href
-      } else if (!href.startsWith('http')) {
-        href = baseUrl.replace(/\/[^/]*$/, '/') + href
-      }
-
-      items.push({
-        source: '協会けんぽ',
-        organizationName: '全国健康保険協会（協会けんぽ）',
-        projectName: name,
-        procedureType: sectionName,
-        cftIssueDate: dateIso,
-        url: href,
-        prefectureName: '東京都',
-        category: '役務',
-      })
-    }
-  }
-  return items
-}
-
-// =============================
 // 企業年金連合会 スクレイピングAPI
 // =============================
 
@@ -136,60 +38,69 @@ app.get('/api/pfa', async (c) => {
 
 function scrapePfa(html: string): any[] {
   const items: any[] = []
-  // 「日付 案件名 [PDF/ZIP リンク群]」のパターン
-  // li要素または段落ごとに処理
-  // パターン: 令和X年Y月Z日 案件名\n  [ZIP][PDF][PDF] の繰り返し
-  const blockRegex = /(令和\d+年\d+月\d+日)\s+([\s\S]*?)(?=令和\d+年\d+月\d+日|$)/g
-  let m
-  while ((m = blockRegex.exec(html)) !== null) {
-    const dateRaw = m[1].trim()
-    const blockContent = m[2]
 
-    // 案件名: blockContentの最初の非タグテキスト
-    const plainText = blockContent.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
-    if (!plainText) continue
+  // テーブル行をパース: <tr><th scope="row">令和X年Y月Z日</th><td>案件名</td><td>ZIP</td><td>PDF</td><td>落札PDF</td></tr>
+  const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi
+  let rowMatch
+  while ((rowMatch = rowRegex.exec(html)) !== null) {
+    const rowHtml = rowMatch[1]
 
-    // 最初のリンク（PDF優先）をメインURLとする
-    const linkMatches = [...blockContent.matchAll(/<a[^>]+href="([^"]+\.(?:pdf|zip))"[^>]*>\s*(?:<[^>]+>)?\s*(PDF|ZIP)[^<]*(?:<\/[^>]+>)?\s*<\/a>/gi)]
-    // PDFリンクを探す
-    let pdfUrl = ''
-    for (const lm of linkMatches) {
-      const ext = lm[1].toLowerCase()
-      if (ext.endsWith('.pdf') && !ext.endsWith('_r.pdf')) {
-        pdfUrl = lm[1]
-        break
+    // th[scope=row] から日付を取得
+    const thMatch = rowHtml.match(/<th[^>]*scope=["']?row["']?[^>]*>([\s\S]*?)<\/th>/i)
+    if (!thMatch) continue
+    const dateRaw = thMatch[1].replace(/<[^>]+>/g, '').trim()
+    // 和暦の日付でなければスキップ
+    if (!/令和|平成/.test(dateRaw)) continue
+
+    // tdを抽出
+    const tds: string[] = []
+    const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi
+    let tdMatch
+    while ((tdMatch = tdRegex.exec(rowHtml)) !== null) {
+      tds.push(tdMatch[1])
+    }
+    if (tds.length < 1) continue
+
+    // td[0] = 案件名
+    const projectName = tds[0].replace(/<[^>]+>/g, '').trim()
+    if (!projectName) continue
+
+    // td[1] = 入札説明書(ZIP), td[2] = 公告(PDF), td[3] = 落札(PDF)
+    const attachments: any[] = []
+    let mainUrl = ''
+
+    const labelMap: Record<number, string> = {
+      1: '入札説明書',
+      2: '公告PDF',
+      3: '落札（契約）PDF',
+    }
+
+    for (let i = 1; i < tds.length && i <= 3; i++) {
+      const linkMatches = [...tds[i].matchAll(/<a[^>]+href="([^"]+)"[^>]*>/gi)]
+      for (const lm of linkMatches) {
+        let uri = lm[1]
+        // 既に絶対URLの場合はそのまま
+        if (!uri.startsWith('http')) {
+          uri = 'https://www.pfa.or.jp' + (uri.startsWith('/') ? uri : '/chotatsu/ichiran/' + uri)
+        }
+        const label = labelMap[i] || `添付${i}`
+        attachments.push({ name: label, uri })
+        // 公告PDFをメインURLにする
+        if (i === 2 && !mainUrl) mainUrl = uri
       }
     }
-    if (!pdfUrl && linkMatches.length > 0) {
-      pdfUrl = linkMatches[0][1]
-    }
-
-    // 絶対URLに変換
-    if (pdfUrl && pdfUrl.startsWith('files/')) {
-      pdfUrl = 'https://www.pfa.or.jp/chotatsu/ichiran/' + pdfUrl
-    } else if (pdfUrl && pdfUrl.startsWith('/')) {
-      pdfUrl = 'https://www.pfa.or.jp' + pdfUrl
-    }
+    // 公告PDFがない場合、入札説明書のURLをメインに
+    if (!mainUrl && attachments.length > 0) mainUrl = attachments[0].uri
 
     const dateIso = convertJapaneseDate(dateRaw)
-
-    // 添付ファイルリスト
-    const attachments: any[] = []
-    for (const lm of linkMatches) {
-      let uri = lm[1]
-      if (uri.startsWith('files/')) uri = 'https://www.pfa.or.jp/chotatsu/ichiran/' + uri
-      else if (uri.startsWith('/')) uri = 'https://www.pfa.or.jp' + uri
-      const label = lm[0].replace(/<[^>]+>/g, '').trim()
-      attachments.push({ name: label || uri.split('/').pop() || uri, uri })
-    }
 
     items.push({
       source: '企業年金連合会',
       organizationName: '企業年金連合会',
-      projectName: plainText.split('PDF')[0].split('ZIP')[0].trim().replace(/\s+/g, ' ').substring(0, 100),
+      projectName,
       procedureType: '一般競争入札',
       cftIssueDate: dateIso,
-      url: pdfUrl || 'https://www.pfa.or.jp/chotatsu/ichiran/index.html',
+      url: mainUrl || 'https://www.pfa.or.jp/chotatsu/ichiran/index.html',
       prefectureName: '東京都',
       category: '役務',
       attachments,
@@ -1104,7 +1015,8 @@ function showPage(page) {
   document.querySelectorAll('.sidebar-link').forEach(el => el.classList.remove('active'));
 
   document.getElementById('page-' + page).classList.remove('hidden');
-  document.getElementById('nav-' + page).classList.add('active');
+  const navEl = document.getElementById('nav-' + page);
+  if (navEl) navEl.classList.add('active');
   currentPage = page;
 
   const titles = {
@@ -1114,9 +1026,24 @@ function showPage(page) {
     construction: '工事案件',
     goods: '物品案件',
     service: '役務案件',
-    kyoukaikenpo: '協会けんぽ 調達情報'
+    kyoukaikenpo: '協会けんぽ 調達情報',
+    pfa: '企業年金連合会 調達情報',
+    all: '全ソース一括検索',
+  };
+  const subtitles = {
+    dashboard: '官公需ポータル・協会けんぽ・企業年金連合会のリアルタイムデータ',
+    search: '官公需情報ポータルサイト (kkj.go.jp) のリアルタイムデータ',
+    new: '官公需情報ポータルサイト (kkj.go.jp) のリアルタイムデータ',
+    construction: '官公需情報ポータルサイト (kkj.go.jp) のリアルタイムデータ',
+    goods: '官公需情報ポータルサイト (kkj.go.jp) のリアルタイムデータ',
+    service: '官公需情報ポータルサイト (kkj.go.jp) のリアルタイムデータ',
+    kyoukaikenpo: '全国健康保険協会 公式サイトから直接取得',
+    pfa: '企業年金連合会 公式サイトから直接取得',
+    all: '官公需ポータル・協会けんぽ・企業年金連合会 3ソースを横断検索',
   };
   document.getElementById('page-title').textContent = titles[page] || page;
+  const subtitleEl = document.getElementById('page-subtitle');
+  if (subtitleEl) subtitleEl.textContent = subtitles[page] || '';
 
   // ページ固有の初期化
   if (page === 'dashboard') {
@@ -1131,6 +1058,10 @@ function showPage(page) {
     loadCategoryPage('service', '3', '役務案件');
   } else if (page === 'kyoukaikenpo') {
     loadKyoukaikenpo();
+  } else if (page === 'pfa') {
+    loadPfa();
+  } else if (page === 'all') {
+    loadAll();
   }
 }
 
@@ -1475,6 +1406,246 @@ function sortResults(type) {
   list.innerHTML = '';
   sorted.forEach(item => list.innerHTML += renderListItem(item));
   searchResults = sorted;
+}
+
+// ========================
+// 企業年金連合会
+// ========================
+async function loadPfa() {
+  const area = document.getElementById('pfa-result-area');
+  const query = document.getElementById('pfa-query').value.trim();
+
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">企業年金連合会から調達情報を取得中...</p></div></div>\`;
+
+  try {
+    const params = {};
+    if (query) params.keyword = query;
+
+    const res = await axios.get('/api/pfa', { params });
+    const data = res.data;
+
+    if (data.error) {
+      area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+        <i class="fas fa-exclamation-triangle text-yellow-500 text-3xl mb-3"></i>
+        <p class="text-gray-600">エラーが発生しました</p>
+        <p class="text-xs text-gray-400 mt-1">\${escHtml(data.error)}</p>
+        <p class="text-xs text-gray-400 mt-2">企業年金連合会のサイトが一時的に取得できない場合があります。<br>
+          <a href="https://www.pfa.or.jp/chotatsu/ichiran/index.html" target="_blank" class="text-blue-500 hover:underline">公式サイトで直接ご確認ください</a>
+        </p>
+      </div>\`;
+      return;
+    }
+
+    if (!data.items || data.items.length === 0) {
+      area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+        <i class="fas fa-search text-gray-300 text-4xl mb-4"></i>
+        <p class="text-gray-500 text-lg">案件が見つかりませんでした</p>
+        <p class="text-xs text-gray-400 mt-2">
+          <a href="https://www.pfa.or.jp/chotatsu/ichiran/index.html" target="_blank" class="text-blue-500 hover:underline">公式サイトで直接ご確認ください</a>
+        </p>
+      </div>\`;
+      return;
+    }
+
+    let html = \`
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100">
+        <div class="p-5 border-b border-gray-100 flex items-center justify-between">
+          <h3 class="font-bold text-gray-800 flex items-center gap-2">
+            <i class="fas fa-list text-amber-500"></i>
+            調達案件一覧
+            <span class="ml-2 text-xs bg-amber-50 text-amber-600 px-2 py-0.5 rounded-full font-normal">
+              \${data.totalHits} 件
+            </span>
+          </h3>
+        </div>
+        <div class="divide-y divide-gray-50">
+    \`;
+
+    data.items.forEach(item => {
+      const issueDate = formatDisplayDate(item.cftIssueDate);
+      html += \`
+        <div class="px-5 py-4 hover:bg-amber-50 transition-colors cursor-pointer" onclick='showModal(\${JSON.stringify(item).replace(/'/g, "\\\\'")})'>\`
+        + \`
+          <div class="flex items-start justify-between gap-4">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 mb-1">
+                \${issueDate ? \`<span class="text-xs text-gray-400"><i class="fas fa-calendar mr-1"></i>\${issueDate}</span>\` : ''}
+                <span class="tag bg-amber-50 text-amber-700 border border-amber-200 text-xs">入札・競争</span>
+              </div>
+              <p class="text-sm font-medium text-gray-800 leading-snug hover:text-amber-700">\${escHtml(item.projectName)}</p>
+            </div>
+            <div class="flex items-center gap-2 flex-shrink-0">
+              \${(item.url && item.url.endsWith('.pdf')) ? \`
+                <a href="\${escHtml(item.url)}" target="_blank" onclick="event.stopPropagation()"
+                   class="text-xs bg-red-50 text-red-600 border border-red-200 px-2.5 py-1 rounded-lg hover:bg-red-100 flex items-center gap-1">
+                  <i class="fas fa-file-pdf"></i> PDF
+                </a>
+              \` : ''}
+              \${(item.attachments && item.attachments.some(a => a.uri.endsWith('.zip'))) ? \`
+                <span class="text-xs bg-gray-50 text-gray-500 border border-gray-200 px-2.5 py-1 rounded-lg flex items-center gap-1">
+                  <i class="fas fa-file-archive"></i> ZIP
+                </span>
+              \` : ''}
+              <i class="fas fa-chevron-right text-gray-300 text-xs"></i>
+            </div>
+          </div>
+        </div>
+      \`;
+    });
+
+    html += \`</div></div>
+      <div class="mt-4 text-center text-xs text-gray-400">
+        <i class="fas fa-info-circle mr-1"></i>
+        データ出典: <a href="https://www.pfa.or.jp/chotatsu/ichiran/index.html" target="_blank" class="text-blue-400 hover:underline">企業年金連合会 調達情報一覧</a>
+      </div>
+    \`;
+
+    area.innerHTML = html;
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+      <i class="fas fa-exclamation-triangle text-yellow-500 text-3xl mb-3"></i>
+      <p class="text-gray-600">取得に失敗しました</p>
+      <p class="text-xs text-gray-400 mt-1">\${e.message}</p>
+    </div>\`;
+  }
+}
+
+// ========================
+// 全ソース一括検索
+// ========================
+async function loadAll() {
+  const area = document.getElementById('all-result-area');
+  const query = document.getElementById('all-query').value.trim();
+  const useSrcKkj = document.getElementById('src-kkj').checked;
+  const useSrcKkp = document.getElementById('src-kkp').checked;
+  const useSrcPfa = document.getElementById('src-pfa').checked;
+
+  if (!useSrcKkj && !useSrcKkp && !useSrcPfa) {
+    area.innerHTML = \`<div class="text-center py-8 bg-white rounded-2xl border border-gray-100">
+      <p class="text-gray-500">検索対象ソースを1つ以上選択してください</p>
+    </div>\`;
+    return;
+  }
+
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">全ソースを横断検索中...</p></div></div>\`;
+
+  try {
+    const sources = [];
+    if (useSrcKkj) sources.push('kkj');
+    if (useSrcKkp) sources.push('kyoukaikenpo');
+    if (useSrcPfa) sources.push('pfa');
+
+    const params = { sources: sources.join(',') };
+    if (query) params.keyword = query;
+
+    const res = await axios.get('/api/search-all', { params });
+    const data = res.data;
+
+    if (!data.items || data.items.length === 0) {
+      area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+        <i class="fas fa-search text-gray-300 text-4xl mb-4"></i>
+        <p class="text-gray-500 text-lg">案件が見つかりませんでした</p>
+        <p class="text-xs text-gray-400 mt-2">キーワードを変更するか、検索対象ソースを確認してください</p>
+      </div>\`;
+      return;
+    }
+
+    // ソース別カウント
+    const sourceCounts = {};
+    data.items.forEach(item => {
+      const src = item.source || '不明';
+      sourceCounts[src] = (sourceCounts[src] || 0) + 1;
+    });
+
+    const sourceColors = {
+      '官公需ポータル': 'bg-blue-50 text-blue-700 border-blue-200',
+      '協会けんぽ (公開中)': 'bg-rose-50 text-rose-700 border-rose-200',
+      '協会けんぽ': 'bg-rose-50 text-rose-700 border-rose-200',
+      '企業年金連合会': 'bg-amber-50 text-amber-700 border-amber-200',
+    };
+
+    let summaryHtml = '<div class="flex flex-wrap gap-2 mb-4">';
+    for (const [src, cnt] of Object.entries(sourceCounts)) {
+      const colorCls = Object.entries(sourceColors).find(([k]) => src.includes(k.split(' ')[0]))?.[1] || 'bg-gray-50 text-gray-700 border-gray-200';
+      summaryHtml += \`<span class="tag border \${colorCls} px-3 py-1 text-xs">\${escHtml(src)}: \${cnt}件</span>\`;
+    }
+    summaryHtml += '</div>';
+
+    let html = \`
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100">
+        <div class="p-5 border-b border-gray-100">
+          <h3 class="font-bold text-gray-800 flex items-center gap-2 mb-3">
+            <i class="fas fa-layer-group text-indigo-500"></i>
+            一括検索結果
+            <span class="ml-2 text-xs bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full font-normal">
+              計 \${data.totalHits} 件
+            </span>
+          </h3>
+          \${summaryHtml}
+          \${data.errors ? \`<div class="text-xs text-orange-600 bg-orange-50 border border-orange-200 rounded-lg px-3 py-2">
+            <i class="fas fa-exclamation-circle mr-1"></i>一部ソースで取得エラーが発生しました（取得できたデータのみ表示しています）
+          </div>\` : ''}
+        </div>
+        <div id="result-list" class="divide-y divide-gray-50">
+    \`;
+
+    data.items.forEach(item => {
+      html += renderAllItem(item);
+    });
+
+    html += \`</div></div>\`;
+    area.innerHTML = html;
+    searchResults = data.items;
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+      <i class="fas fa-exclamation-triangle text-yellow-500 text-3xl mb-3"></i>
+      <p class="text-gray-600">一括検索に失敗しました</p>
+      <p class="text-xs text-gray-400 mt-1">\${e.message}</p>
+    </div>\`;
+  }
+}
+
+function renderAllItem(item) {
+  const catBadge = getCategoryBadge(item.category);
+  const issueDate = formatDisplayDate(item.cftIssueDate);
+  const deadline = formatDisplayDate(item.tenderSubmissionDeadline);
+  const deadlineWarning = isDeadlineSoon(item.tenderSubmissionDeadline);
+
+  const sourceColors = {
+    '官公需ポータル': 'bg-blue-50 text-blue-600',
+    '協会けんぽ': 'bg-rose-50 text-rose-600',
+    '企業年金連合会': 'bg-amber-50 text-amber-600',
+  };
+  const src = item.source || '';
+  const srcColorCls = Object.entries(sourceColors).find(([k]) => src.includes(k.split(' ')[0]))?.[1] || 'bg-gray-50 text-gray-600';
+  const srcBadge = src ? \`<span class="tag \${srcColorCls} text-xs">\${escHtml(src)}</span>\` : '';
+
+  return \`
+    <div class="result-row px-6 py-4 cursor-pointer" onclick='showModal(\${JSON.stringify(item).replace(/'/g, "\\\\'")})'>\`
+    + \`
+      <div class="flex items-start justify-between gap-4">
+        <div class="flex-1 min-w-0">
+          <div class="flex flex-wrap items-center gap-2 mb-2">
+            \${srcBadge}
+            \${catBadge}
+            \${item.procedureType ? \`<span class="tag bg-gray-100 text-gray-600">\${escHtml(item.procedureType)}</span>\` : ''}
+            \${deadlineWarning ? '<span class="tag bg-red-100 text-red-600"><i class="fas fa-fire-alt mr-1"></i>締切間近</span>' : ''}
+          </div>
+          <h4 class="text-sm font-semibold text-gray-800 leading-snug mb-2 hover:text-blue-600">
+            \${escHtml(item.projectName || '（案件名なし）')}
+          </h4>
+          <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500">
+            \${item.organizationName ? \`<span><i class="fas fa-building mr-1 text-gray-400"></i>\${escHtml(item.organizationName)}</span>\` : ''}
+            \${issueDate ? \`<span><i class="fas fa-calendar mr-1 text-gray-400"></i>公告: \${issueDate}</span>\` : ''}
+            \${deadline ? \`<span class="\${deadlineWarning ? 'text-red-500 font-medium' : ''}"><i class="fas fa-clock mr-1 text-gray-400"></i>締切: \${deadline}</span>\` : ''}
+          </div>
+        </div>
+        <div class="flex-shrink-0">
+          <i class="fas fa-chevron-right text-gray-300 text-sm mt-1"></i>
+        </div>
+      </div>
+    </div>
+  \`;
 }
 
 // ========================
