@@ -708,13 +708,19 @@ function renderHTML(): string {
     </a>
     <div class="border-t border-white/20 my-2"></div>
     <p class="text-xs text-blue-300 px-4 py-1 font-medium uppercase tracking-wider">特定機関</p>
+    <a href="#" onclick="showPage('all')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-all">
+      <i class="fas fa-layer-group w-4"></i> 全ソース一括検索
+    </a>
     <a href="#" onclick="showPage('kyoukaikenpo')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-kyoukaikenpo">
       <i class="fas fa-heartbeat w-4"></i> 協会けんぽ
     </a>
+    <a href="#" onclick="showPage('pfa')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-pfa">
+      <i class="fas fa-piggy-bank w-4"></i> 企業年金連合会
+    </a>
   </nav>
   <div class="p-4 border-t border-white/20">
-    <p class="text-xs text-blue-200 text-center">データ提供: 官公需情報ポータルサイト</p>
-    <p class="text-xs text-blue-300 text-center mt-1">中小企業庁</p>
+    <p class="text-xs text-blue-200 text-center">官公需ポータル・協会けんぽ</p>
+    <p class="text-xs text-blue-300 text-center mt-1">企業年金連合会 連携</p>
   </div>
 </div>
 
@@ -726,7 +732,7 @@ function renderHTML(): string {
     <div class="flex items-center justify-between">
       <div>
         <h2 id="page-title" class="text-xl font-bold text-gray-800">ダッシュボード</h2>
-        <p class="text-xs text-gray-500 mt-0.5">官公需情報ポータルサイト (kkj.go.jp) のリアルタイムデータ</p>
+        <p class="text-xs text-gray-500 mt-0.5" id="page-subtitle">官公需情報ポータルサイト・協会けんぽ・企業年金連合会のリアルタイムデータ</p>
       </div>
       <div class="flex items-center gap-4">
         <span id="last-updated" class="text-xs text-gray-400"></span>
@@ -984,6 +990,87 @@ function renderHTML(): string {
       </div>
 
       <div id="kkp-result-area"></div>
+    </div>
+
+    <!-- 企業年金連合会専用ページ -->
+    <div id="page-pfa" class="page-content hidden">
+      <div class="bg-gradient-to-br from-amber-50 to-yellow-50 border border-amber-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-amber-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-piggy-bank text-amber-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">企業年金連合会 調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">企業年金連合会公式サイトの調達情報（入札・競争）を直接取得します。</p>
+            <div class="flex flex-wrap gap-2">
+              <a href="https://www.pfa.or.jp/chotatsu/ichiran/index.html" target="_blank"
+                 class="text-xs bg-white border border-amber-200 text-amber-600 px-3 py-1.5 rounded-lg hover:bg-amber-50 flex items-center gap-1">
+                <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="pfa-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-amber-300"
+              onkeypress="if(event.key==='Enter') loadPfa()">
+          </div>
+          <button onclick="loadPfa()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #d97706, #b45309);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="pfa-result-area"></div>
+    </div>
+
+    <!-- 全ソース一括検索ページ -->
+    <div id="page-all" class="page-content hidden">
+      <div class="bg-gradient-to-br from-indigo-50 to-purple-50 border border-indigo-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-indigo-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-layer-group text-indigo-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">全ソース一括検索</h3>
+            <p class="text-sm text-gray-600">官公需ポータル・協会けんぽ・企業年金連合会の全ソースを横断して一括検索できます。</p>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 mb-6">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+          <div class="md:col-span-2">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="all-query" type="text" placeholder="案件名・内容で横断検索..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              onkeypress="if(event.key==='Enter') loadAll()">
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-gray-600 mb-1">検索対象ソース</label>
+            <div class="flex flex-col gap-1.5 pt-1">
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-kkj" checked class="rounded text-indigo-600"> 官公需ポータル（kkj.go.jp）
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-kkp" checked class="rounded text-rose-600"> 協会けんぽ
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-pfa" checked class="rounded text-amber-600"> 企業年金連合会
+              </label>
+            </div>
+          </div>
+        </div>
+        <button onclick="loadAll()"
+          class="btn-primary text-white px-8 py-2.5 rounded-xl font-medium text-sm shadow-md flex items-center gap-2">
+          <i class="fas fa-search"></i> 一括検索する
+        </button>
+      </div>
+      <div id="all-result-area"></div>
     </div>
 
   </main>
@@ -1302,9 +1389,8 @@ async function loadKyoukaikenpo() {
       groups[key].push(item);
     });
 
-    const archiveLabel = archive
-      ? ['r07'=>'令和7年度', 'r06'=>'令和6年度', 'r05'=>'令和5年度'][archive] || archive
-      : '令和8年度（公開中）';
+    const archiveLabels = { 'r07': '令和7年度', 'r06': '令和6年度', 'r05': '令和5年度' };
+    const archiveLabel = archive ? (archiveLabels[archive] || archive) : '令和8年度（公開中）';
 
     const badgeColors = {
       '一般競争入札': 'bg-blue-50 text-blue-700 border border-blue-200',
