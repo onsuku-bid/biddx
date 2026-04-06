@@ -272,6 +272,15 @@ app.get('/api/search', async (c) => {
     const xmlText = await response.text()
     const parsed = parseKkjXml(xmlText)
 
+    // 案件名のみでフィルタリング（案①：精度向上）
+    if (query && parsed.items) {
+      const lowerQuery = query.toLowerCase()
+      parsed.items = (parsed.items as any[]).filter((item: any) =>
+        (item.projectName || '').toLowerCase().includes(lowerQuery)
+      )
+      parsed.totalHits = parsed.items.length
+    }
+
     return c.json(parsed)
   } catch (error) {
     console.error('API Error:', error)
@@ -430,13 +439,10 @@ app.get('/api/kyoukaikenpo', async (c) => {
     const label = archive ? `協会けんぽ (${archive})` : '協会けんぽ (公開中)'
     const items = parseKyoukaikenpoHtml(html, label)
 
-    // キーワードフィルタ
+    // キーワードフィルタ（案件名のみ）
     const query = c.req.query('query') || ''
     const filtered = query
-      ? items.filter(i =>
-          i.projectName.includes(query) ||
-          (i.procedureType || '').includes(query)
-        )
+      ? items.filter(i => (i.projectName || '').includes(query))
       : items
 
     return c.json({ totalHits: filtered.length, items: filtered, source: '協会けんぽ' })
@@ -2129,11 +2135,10 @@ async function runNotifyCheck(env: {
     errors.push(`企業年金連合会: ${String(e)}`)
   }
 
-  // キーワードフィルタリング & 新着判定
+  // キーワードフィルタリング & 新着判定（案件名のみ）
   for (const kw of keywords) {
     const matched = allItems.filter(item =>
-      (item.projectName || '').includes(kw) ||
-      (item.projectDescription || '').includes(kw)
+      (item.projectName || '').includes(kw)
     )
 
     const seenIds = getSeenIds(kw)
