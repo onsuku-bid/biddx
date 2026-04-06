@@ -1,0 +1,27 @@
+name: 入札DX 毎日通知チェック
+
+on:
+  schedule:
+    # 毎日 11:00 JST = 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    # 手動実行も可能
+
+jobs:
+  notify-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: キーワード通知チェック実行
+        run: |
+          echo "通知チェック開始: $(date)"
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            "https://biddx.pages.dev/api/notify-check?secret=${{ secrets.NOTIFY_SECRET }}")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -1)
+          echo "レスポンス: $BODY"
+          echo "HTTPステータス: $HTTP_CODE"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "エラー: HTTPステータス $HTTP_CODE"
+            exit 1
+          fi
+          echo "通知チェック完了"

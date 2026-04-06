@@ -6,29 +6,10 @@
   "compatibility_flags": [
     "nodejs_compat"
   ]
-  // "vars": {
-  //   "MY_VAR": "my-variable"
-  // },
-  // "kv_namespaces": [
-  //   {
-  //     "binding": "MY_KV_NAMESPACE",
-  //     "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-  //   }
-  // ],
-  // "r2_buckets": [
-  //   {
-  //     "binding": "MY_BUCKET",
-  //     "bucket_name": "my-bucket"
-  //   }
-  // ],
-  // "d1_databases": [
-  //   {
-  //     "binding": "MY_DB",
-  //     "database_name": "my-database",
-  //     "database_id": ""
-  //   }
-  // ],
-  // "ai": {
-  //   "binding": "AI"
-  // }
+  // 環境変数はCloudflareダッシュボード or wrangler secret put で設定
+  // ローカル開発時は .dev.vars に記載
+  // RESEND_API_KEY=re_xxxx
+  // NOTIFY_EMAILS=xxx@example.com,yyy@example.com
+  // NOTIFY_KEYWORDS=動画制作,研修
+  // NOTIFY_SECRET=bid-notify-2024
 }

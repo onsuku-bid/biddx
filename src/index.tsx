@@ -2,7 +2,14 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { serveStatic } from 'hono/cloudflare-workers'
 
-const app = new Hono()
+type Bindings = {
+  RESEND_API_KEY: string
+  NOTIFY_EMAILS: string
+  NOTIFY_KEYWORDS: string
+  NOTIFY_SECRET: string
+}
+
+const app = new Hono<{ Bindings: Bindings }>()
 
 // CORS設定
 app.use('/api/*', cors())
@@ -534,15 +541,10 @@ function formatDate(date: Date): string {
 }
 
 // =============================
-// フロントエンド HTML配信
+// フロントエンド HTML配信（APIルートより後に定義）
 // =============================
-app.get('/', (c) => {
-  return c.html(renderHTML())
-})
-
-app.get('*', (c) => {
-  return c.html(renderHTML())
-})
+// ※ notify-check / notify-status は renderHTML() 関数定義後、
+//   app.get('/') より前に登録するため下部に移動済み
 
 function renderHTML(): string {
   return `<!DOCTYPE html>
@@ -627,6 +629,10 @@ function renderHTML(): string {
     </a>
     <a href="#" onclick="showPage('pfa')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-pfa">
       <i class="fas fa-piggy-bank w-4"></i> 企業年金連合会
+    </a>
+    <div class="border-t border-white/20 my-2"></div>
+    <a href="#" onclick="showPage('notify')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-notify">
+      <i class="fas fa-bell w-4"></i> メール通知設定
     </a>
   </nav>
   <div class="p-4 border-t border-white/20">
@@ -984,6 +990,82 @@ function renderHTML(): string {
       <div id="all-result-area"></div>
     </div>
 
+    <!-- メール通知設定ページ -->
+    <div id="page-notify" class="page-content hidden">
+
+      <!-- ヘッダーカード -->
+      <div class="bg-gradient-to-br from-violet-50 to-purple-50 border border-violet-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-violet-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-bell text-violet-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">メール通知設定</h3>
+            <p class="text-sm text-gray-600">設定したキーワードに一致する新着案件が見つかった際に、メールで自動通知します。<br>毎日 <strong>午前11時</strong> に全ソースをチェックします。</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- 現在の設定表示 -->
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 mb-6">
+        <h4 class="font-bold text-gray-700 mb-4 flex items-center gap-2">
+          <i class="fas fa-cog text-gray-400"></i> 現在の通知設定
+        </h4>
+        <div id="notify-status-area">
+          <div class="flex justify-center py-8">
+            <div class="loading-spinner"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 手動テスト -->
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 mb-6">
+        <h4 class="font-bold text-gray-700 mb-2 flex items-center gap-2">
+          <i class="fas fa-vial text-violet-500"></i> 今すぐ通知チェックを実行
+        </h4>
+        <p class="text-sm text-gray-500 mb-4">手動でキーワードチェックを実行し、新着案件があればメールを送信します。</p>
+        <div class="flex items-center gap-3">
+          <button onclick="runNotifyCheck()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #7c3aed, #6d28d9);">
+            <i class="fas fa-play"></i> チェックを実行する
+          </button>
+          <span id="notify-run-status" class="text-sm text-gray-500"></span>
+        </div>
+        <div id="notify-run-result" class="mt-4 hidden"></div>
+      </div>
+
+      <!-- スケジュール情報 -->
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+        <h4 class="font-bold text-gray-700 mb-4 flex items-center gap-2">
+          <i class="fas fa-clock text-gray-400"></i> 自動実行スケジュール
+        </h4>
+        <div class="bg-gray-50 rounded-xl p-4 text-sm text-gray-600 space-y-2">
+          <div class="flex items-center gap-3">
+            <i class="fas fa-check-circle text-green-500 w-4"></i>
+            <span>毎日 <strong>11:00 (JST)</strong> に自動チェック</span>
+          </div>
+          <div class="flex items-center gap-3">
+            <i class="fas fa-check-circle text-green-500 w-4"></i>
+            <span>対象ソース: 官公需ポータル・協会けんぽ・企業年金連合会</span>
+          </div>
+          <div class="flex items-center gap-3">
+            <i class="fas fa-check-circle text-green-500 w-4"></i>
+            <span>監視キーワード: <strong>動画制作</strong>・<strong>研修</strong></span>
+          </div>
+          <div class="flex items-center gap-3">
+            <i class="fas fa-check-circle text-green-500 w-4"></i>
+            <span>通知先: contents@onsuku.jp・ons.test.888@gmail.com</span>
+          </div>
+          <div class="flex items-center gap-3">
+            <i class="fas fa-info-circle text-blue-400 w-4"></i>
+            <span class="text-gray-500">前回チェック以降の新着案件のみ通知（重複通知なし）</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
   </main>
 </div>
 
@@ -1029,6 +1111,7 @@ function showPage(page) {
     kyoukaikenpo: '協会けんぽ 調達情報',
     pfa: '企業年金連合会 調達情報',
     all: '全ソース一括検索',
+    notify: 'メール通知設定',
   };
   const subtitles = {
     dashboard: '官公需ポータル・協会けんぽ・企業年金連合会のリアルタイムデータ',
@@ -1040,6 +1123,7 @@ function showPage(page) {
     kyoukaikenpo: '全国健康保険協会 公式サイトから直接取得',
     pfa: '企業年金連合会 公式サイトから直接取得',
     all: '官公需ポータル・協会けんぽ・企業年金連合会 3ソースを横断検索',
+    notify: 'キーワード一致の新着案件をメールで自動通知',
   };
   document.getElementById('page-title').textContent = titles[page] || page;
   const subtitleEl = document.getElementById('page-subtitle');
@@ -1062,6 +1146,8 @@ function showPage(page) {
     loadPfa();
   } else if (page === 'all') {
     loadAll();
+  } else if (page === 'notify') {
+    loadNotifyStatus();
   }
 }
 
@@ -1750,11 +1836,404 @@ function escHtml(str) {
 document.getElementById('s-query').addEventListener('keypress', e => { if (e.key === 'Enter') doSearch(); });
 document.getElementById('s-orgname').addEventListener('keypress', e => { if (e.key === 'Enter') doSearch(); });
 
+// ========================
+// 通知設定
+// ========================
+async function loadNotifyStatus() {
+  const area = document.getElementById('notify-status-area');
+  try {
+    const res = await axios.get('/api/notify-status');
+    const d = res.data;
+    const configured = d.resendConfigured;
+
+    area.innerHTML = \`
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="bg-gray-50 rounded-xl p-4">
+          <p class="text-xs font-semibold text-gray-500 uppercase mb-2">メール送信サービス (Resend)</p>
+          <div class="flex items-center gap-2">
+            <span class="w-2.5 h-2.5 rounded-full \${configured ? 'bg-green-400' : 'bg-red-400'}"></span>
+            <span class="text-sm font-medium text-gray-700">\${configured ? '✅ 設定済み' : '❌ 未設定'}</span>
+          </div>
+        </div>
+        <div class="bg-gray-50 rounded-xl p-4">
+          <p class="text-xs font-semibold text-gray-500 uppercase mb-2">監視キーワード</p>
+          <div class="flex flex-wrap gap-1.5">
+            \${(d.notifyKeywords || []).map(kw => \`<span class="tag bg-violet-100 text-violet-700 px-2 py-0.5">\${escHtml(kw)}</span>\`).join('')}
+          </div>
+        </div>
+        <div class="bg-gray-50 rounded-xl p-4">
+          <p class="text-xs font-semibold text-gray-500 uppercase mb-2">通知先メールアドレス</p>
+          <div class="space-y-1">
+            \${(d.notifyEmails || []).map(e => \`<p class="text-sm text-gray-700"><i class="fas fa-envelope mr-2 text-gray-400"></i>\${escHtml(e)}</p>\`).join('')}
+          </div>
+        </div>
+        <div class="bg-gray-50 rounded-xl p-4">
+          <p class="text-xs font-semibold text-gray-500 uppercase mb-2">自動チェック時刻</p>
+          <p class="text-sm font-medium text-gray-700"><i class="fas fa-clock mr-2 text-gray-400"></i>\${d.schedule}</p>
+        </div>
+      </div>
+    \`;
+  } catch(e) {
+    area.innerHTML = \`<p class="text-sm text-red-500">設定の読み込みに失敗しました: \${e.message}</p>\`;
+  }
+}
+
+async function runNotifyCheck() {
+  const btn = document.querySelector('[onclick="runNotifyCheck()"]');
+  const statusEl = document.getElementById('notify-run-status');
+  const resultEl = document.getElementById('notify-run-result');
+
+  btn.disabled = true;
+  statusEl.textContent = 'チェック中...';
+  statusEl.className = 'text-sm text-blue-500';
+  resultEl.classList.add('hidden');
+
+  try {
+    const res = await axios.get('/api/notify-check?secret=bid-notify-2024', { timeout: 60000 });
+    const d = res.data;
+
+    let html = \`<div class="bg-green-50 border border-green-200 rounded-xl p-4">
+      <p class="font-semibold text-green-700 mb-3"><i class="fas fa-check-circle mr-2"></i>チェック完了</p>
+      <div class="space-y-2 text-sm text-gray-700">
+        <p><strong>チェック総件数:</strong> \${(d.checkedTotal || 0).toLocaleString()} 件</p>\`;
+
+    const keywords = Object.keys(d.newItems || {});
+    for (const kw of keywords) {
+      const cnt = d.newItems[kw];
+      const sent = d.mailSent?.[kw];
+      html += \`<p>
+        <strong>「\${escHtml(kw)}」新着:</strong> \${cnt} 件
+        \${cnt > 0
+          ? (sent ? '<span class="text-green-600 ml-2"><i class="fas fa-paper-plane mr-1"></i>メール送信済み</span>'
+                  : '<span class="text-orange-500 ml-2"><i class="fas fa-exclamation-circle mr-1"></i>送信スキップ</span>')
+          : '<span class="text-gray-400 ml-2">（新着なし）</span>'}
+      </p>\`;
+    }
+
+    if (d.errors && d.errors.length > 0) {
+      html += \`<div class="mt-2 p-2 bg-yellow-50 rounded text-xs text-yellow-700">
+        <i class="fas fa-exclamation-triangle mr-1"></i>警告: \${d.errors.join(' / ')}
+      </div>\`;
+    }
+
+    html += \`<p class="text-xs text-gray-400 mt-2">実行時刻: \${new Date(d.timestamp).toLocaleString('ja-JP')}</p>
+      </div></div>\`;
+
+    resultEl.innerHTML = html;
+    resultEl.classList.remove('hidden');
+    statusEl.textContent = '完了';
+    statusEl.className = 'text-sm text-green-600';
+  } catch(e) {
+    resultEl.innerHTML = \`<div class="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-600">
+      <i class="fas fa-times-circle mr-2"></i>エラー: \${e.message}
+    </div>\`;
+    resultEl.classList.remove('hidden');
+    statusEl.textContent = 'エラー';
+    statusEl.className = 'text-sm text-red-500';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ========================
 // 初期表示
+// ========================
 loadDashboard();
 </script>
 </body>
 </html>`
 }
+
+// ============================================================
+// キーワード通知チェック API
+// ============================================================
+
+// 既出案件IDを保存するグローバルストア（サーバーメモリ）
+// Cloudflare Pages本番ではKVを使用するためリクエスト間でリセットされるが、
+// サンドボックスのPM2プロセスでは永続する
+const seenIdsStore: Map<string, Set<string>> = new Map()
+
+function getSeenIds(keyword: string): Set<string> {
+  if (!seenIdsStore.has(keyword)) {
+    seenIdsStore.set(keyword, new Set())
+  }
+  return seenIdsStore.get(keyword)!
+}
+
+// Resend経由でメール送信
+async function sendEmailViaResend(
+  apiKey: string,
+  to: string[],
+  subject: string,
+  html: string
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: '入札DX通知 <onboarding@resend.dev>',
+        to,
+        subject,
+        html,
+      }),
+    })
+    if (!res.ok) {
+      const body = await res.text()
+      return { ok: false, error: `Resend API error ${res.status}: ${body}` }
+    }
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: String(e) }
+  }
+}
+
+// メール本文HTMLを生成
+function buildEmailHtml(keyword: string, items: any[]): string {
+  const rows = items.map(item => {
+    const date = item.cftIssueDate ? item.cftIssueDate.substring(0, 10) : '不明'
+    const source = item.source || item.organizationName || '不明'
+    const procType = item.procedureType || ''
+    const url = item.url || ''
+    return `
+      <tr>
+        <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;font-size:13px;color:#374151;">${date}</td>
+        <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;font-size:13px;">
+          <a href="${url}" target="_blank" style="color:#2563eb;text-decoration:none;font-weight:500;">${item.projectName || '（案件名なし）'}</a>
+        </td>
+        <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;font-size:12px;color:#6b7280;">${source}</td>
+        <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;font-size:12px;color:#6b7280;">${procType}</td>
+      </tr>`
+  }).join('')
+
+  const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })
+
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f9fafb;font-family:'Helvetica Neue',Arial,sans-serif;">
+  <div style="max-width:700px;margin:32px auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+
+    <!-- ヘッダー -->
+    <div style="background:linear-gradient(135deg,#1e3a5f,#2563eb);padding:24px 32px;">
+      <h1 style="margin:0;color:#ffffff;font-size:20px;font-weight:700;">
+        🔔 入札DX 新着案件通知
+      </h1>
+      <p style="margin:6px 0 0;color:#bfdbfe;font-size:13px;">キーワード「${keyword}」の新着案件が見つかりました</p>
+    </div>
+
+    <!-- 件数サマリー -->
+    <div style="padding:20px 32px;background:#eff6ff;border-bottom:1px solid #dbeafe;">
+      <p style="margin:0;font-size:15px;color:#1d4ed8;font-weight:600;">
+        📋 新着 ${items.length} 件 ／ チェック日時: ${now}
+      </p>
+    </div>
+
+    <!-- 案件テーブル -->
+    <div style="padding:24px 32px;">
+      <table style="width:100%;border-collapse:collapse;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
+        <thead>
+          <tr style="background:#f3f4f6;">
+            <th style="padding:10px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;width:90px;">公告日</th>
+            <th style="padding:10px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">案件名</th>
+            <th style="padding:10px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;width:120px;">発注機関</th>
+            <th style="padding:10px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;width:100px;">種別</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+
+    <!-- フッター -->
+    <div style="padding:16px 32px 24px;border-top:1px solid #f3f4f6;">
+      <p style="margin:0;font-size:12px;color:#9ca3af;line-height:1.6;">
+        このメールは 入札DX 自動通知システム から送信されています。<br>
+        データ出典: 官公需情報ポータルサイト (kkj.go.jp)・全国健康保険協会・企業年金連合会
+      </p>
+    </div>
+
+  </div>
+</body>
+</html>`
+}
+
+// 通知チェック本体ロジック
+async function runNotifyCheck(env: {
+  RESEND_API_KEY?: string
+  NOTIFY_EMAILS?: string
+  NOTIFY_KEYWORDS?: string
+}): Promise<{
+  checked: number
+  newItems: Record<string, any[]>
+  sent: Record<string, boolean>
+  errors: string[]
+}> {
+  const apiKey = env.RESEND_API_KEY || ''
+  const emails = (env.NOTIFY_EMAILS || '').split(',').map(s => s.trim()).filter(Boolean)
+  const keywords = (env.NOTIFY_KEYWORDS || '動画制作,研修').split(',').map(s => s.trim()).filter(Boolean)
+
+  const errors: string[] = []
+  const newItems: Record<string, any[]> = {}
+  const sent: Record<string, boolean> = {}
+  let totalChecked = 0
+
+  // 全ソースから全案件を取得
+  const allItems: any[] = []
+
+  // 官公需ポータル（キーワードごとに検索）
+  for (const kw of keywords) {
+    try {
+      const params = new URLSearchParams({ Query: kw, Count: '50' })
+      const res = await fetch(`http://www.kkj.go.jp/api/?${params.toString()}`, {
+        headers: { 'User-Agent': 'BidSearchApp/1.0' }
+      })
+      const xml = await res.text()
+      const parsed = parseKkjXml(xml)
+      ;(parsed.items || []).forEach((item: any) => {
+        item.source = '官公需ポータル'
+        item._matchKeyword = kw
+        allItems.push(item)
+      })
+      totalChecked += parsed.totalHits || 0
+    } catch (e) {
+      errors.push(`官公需ポータル[${kw}]: ${String(e)}`)
+    }
+  }
+
+  // 協会けんぽ
+  try {
+    const res = await fetch('https://www.kyoukaikenpo.or.jp/disclosure/procurement/', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    const html = await res.text()
+    const items = parseKyoukaikenpoHtml(html, '協会けんぽ')
+    items.forEach((item: any) => allItems.push(item))
+    totalChecked += items.length
+  } catch (e) {
+    errors.push(`協会けんぽ: ${String(e)}`)
+  }
+
+  // 企業年金連合会
+  try {
+    const res = await fetch('https://www.pfa.or.jp/chotatsu/ichiran/index.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    const html = await res.text()
+    const items = scrapePfa(html)
+    items.forEach((item: any) => allItems.push(item))
+    totalChecked += items.length
+  } catch (e) {
+    errors.push(`企業年金連合会: ${String(e)}`)
+  }
+
+  // キーワードフィルタリング & 新着判定
+  for (const kw of keywords) {
+    const matched = allItems.filter(item =>
+      (item.projectName || '').includes(kw) ||
+      (item.projectDescription || '').includes(kw)
+    )
+
+    const seenIds = getSeenIds(kw)
+    const freshItems = matched.filter(item => {
+      const id = item.resultId || item.url || item.projectName || ''
+      return id && !seenIds.has(id)
+    })
+
+    newItems[kw] = freshItems
+
+    // 既出IDを更新
+    matched.forEach(item => {
+      const id = item.resultId || item.url || item.projectName || ''
+      if (id) seenIds.add(id)
+    })
+  }
+
+  // メール送信（新着がある場合のみ）
+  if (apiKey && emails.length > 0) {
+    for (const kw of keywords) {
+      const items = newItems[kw] || []
+      if (items.length === 0) {
+        sent[kw] = false
+        continue
+      }
+      const subject = `【入札DX】「${kw}」新着案件 ${items.length}件`
+      const html = buildEmailHtml(kw, items)
+      const result = await sendEmailViaResend(apiKey, emails, subject, html)
+      sent[kw] = result.ok
+      if (!result.ok) errors.push(`メール送信[${kw}]: ${result.error}`)
+    }
+  }
+
+  return { checked: totalChecked, newItems, sent, errors }
+}
+
+// ===========================
+// POST /api/notify-check
+// 手動テスト & PM2 cronから呼び出すエンドポイント
+// ===========================
+app.get('/api/notify-check', async (c) => {
+  const secret = c.req.query('secret') || ''
+  const envSecret = c.env.NOTIFY_SECRET || 'bid-notify-2024'
+  if (secret !== envSecret) {
+    return c.json({ error: '認証エラー: secretパラメータが必要です' }, 401)
+  }
+
+  const result = await runNotifyCheck({
+    RESEND_API_KEY: c.env.RESEND_API_KEY || '',
+    NOTIFY_EMAILS: c.env.NOTIFY_EMAILS || 'contents@onsuku.jp',
+    NOTIFY_KEYWORDS: c.env.NOTIFY_KEYWORDS || '動画制作,研修',
+  })
+
+  const summary: Record<string, number> = {}
+  for (const [kw, items] of Object.entries(result.newItems)) {
+    summary[kw] = (items as any[]).length
+  }
+
+  return c.json({
+    status: 'ok',
+    checkedTotal: result.checked,
+    newItems: summary,
+    mailSent: result.sent,
+    errors: result.errors.length > 0 ? result.errors : undefined,
+    timestamp: new Date().toISOString(),
+  })
+})
+
+// ===========================
+// GET /api/notify-status
+// 通知設定の確認用（設定が正しいか確認）
+// ===========================
+app.get('/api/notify-status', async (c) => {
+  const apiKey = c.env.RESEND_API_KEY || ''
+  const emails = c.env.NOTIFY_EMAILS || ''
+  const keywords = c.env.NOTIFY_KEYWORDS || ''
+
+  return c.json({
+    resendConfigured: !!apiKey,
+    notifyEmails: emails ? emails.split(',').map(s => s.trim()) : [],
+    notifyKeywords: keywords ? keywords.split(',').map(s => s.trim()) : [],
+    schedule: '毎日 11:00 (JST)',
+    lastCheck: '未実施（初回チェック前）',
+  })
+})
+
+// =============================
+// フロントエンド HTML配信
+// =============================
+app.get('/', (c) => {
+  return c.html(renderHTML())
+})
+
+// SPA: /以外のパスもHTMLを返す（ただし/api/*は上のルートで処理済み）
+app.notFound((c) => {
+  // APIパスは404のままにする
+  if (c.req.path.startsWith('/api/')) {
+    return c.json({ error: 'Not Found', path: c.req.path }, 404)
+  }
+  return c.html(renderHTML())
+})
 
 export default app
