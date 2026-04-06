@@ -547,6 +547,168 @@ function formatDate(date: Date): string {
 }
 
 // =============================
+// 防衛省（内局）スクレイパー
+// URL: https://www.mod.go.jp/j/budget/chotatsu/naikyoku/mitsumori/index.html
+// 構造: テーブル（番号/種別/調達番号/件名/見積依頼書公開日/見積書提出期限/...）
+// =============================
+function scrapeMod(html: string, baseUrl: string): any[] {
+  const items: any[] = []
+  try {
+    // テーブル行を抽出 <tr>...</tr>
+    const trMatches = html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)
+    for (const trMatch of trMatches) {
+      const row = trMatch[1]
+      // tdを抽出
+      const tdMatches = [...row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
+      if (tdMatches.length < 4) continue
+      const cols = tdMatches.map(m => {
+        const text = m[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+        return text
+      })
+      // 件名が入るのは4列目(index=3)
+      const projectName = cols[3] || ''
+      if (!projectName || projectName === '件名') continue
+
+      // 見積依頼書公開日: 5列目(index=4)
+      const dateStr = cols[4] || ''
+      const isoDate = wareki2iso(dateStr)
+
+      // 見積書提出期限: 6列目(index=5)
+      const deadline = cols[5] || ''
+      const isoDeadline = wareki2iso(deadline)
+
+      // PDFリンク抽出
+      const pdfMatches = [...trMatch[1].matchAll(/href="([^"]*\.pdf[^"]*)"/gi)]
+      const pdfUrl = pdfMatches.length > 0
+        ? (pdfMatches[0][1].startsWith('http') ? pdfMatches[0][1] : 'https://www.mod.go.jp' + pdfMatches[0][1])
+        : baseUrl
+      const attachments = pdfMatches.map(m => ({
+        name: 'PDF',
+        uri: m[1].startsWith('http') ? m[1] : 'https://www.mod.go.jp' + m[1]
+      }))
+
+      const kind = cols[1] || ''
+      items.push({
+        resultId: `mod-naikyoku-${cols[0] || ''}-${isoDate}`,
+        projectName,
+        organizationName: '防衛省（内局）',
+        procedureType: '見積合わせ（随意契約）',
+        category: kind.includes('物品') ? '物品' : '役務',
+        cftIssueDate: isoDate,
+        tenderDeadline: isoDeadline,
+        url: pdfUrl,
+        prefectureName: '東京都',
+        source: '防衛省（内局）',
+        attachments,
+      })
+    }
+  } catch (e) {
+    // ignore
+  }
+  return items
+}
+
+// wareki2iso は既に定義済み（共通関数）
+
+// 防衛省情報本部スクレイパー
+// URL: https://www.mod.go.jp/dih/supply/open-r8.html
+// 構造: テーブル（番号/見積期限/件名/履行期限/仕様書PDF/詳細PDF）
+function scrapeModDih(html: string, baseUrl: string): any[] {
+  const items: any[] = []
+  try {
+    const trMatches = html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)
+    for (const trMatch of trMatches) {
+      const row = trMatch[1]
+      const tdMatches = [...row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
+      if (tdMatches.length < 3) continue
+      const cols = tdMatches.map(m => {
+        const text = m[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+        return text
+      })
+
+      // 見積期限: 2列目(index=1)
+      const deadlineStr = cols[1] || ''
+      const isoDeadline = wareki2iso(deadlineStr.split('(')[0].trim())
+
+      // 件名リンクのテキスト: 3列目(index=2)
+      // aタグのテキストを取得
+      const nameMatch = tdMatches[2]?.[1].match(/<a[^>]*>([\s\S]*?)<\/a>/i)
+      const projectName = nameMatch
+        ? nameMatch[1].replace(/<[^>]+>/g, '').replace(/\(PDFを別タブで開く\)/g, '').trim()
+        : cols[2] || ''
+      if (!projectName || projectName === '件名') continue
+
+      // 件名のPDFリンク
+      const mainPdfMatch = tdMatches[2]?.[1].match(/href="([^"]*\.pdf[^"]*)"/i)
+      const mainPdfUrl = mainPdfMatch
+        ? (mainPdfMatch[1].startsWith('http') ? mainPdfMatch[1] : 'https://www.mod.go.jp' + mainPdfMatch[1])
+        : baseUrl
+
+      // 添付（仕様書/詳細PDF）
+      const allPdfMatches = [...trMatch[1].matchAll(/href="([^"]*\.(?:pdf|xlsx)[^"]*)"/gi)]
+      const attachments = allPdfMatches.map(m => ({
+        name: m[1].includes('xlsx') ? '見積書等' : 'PDF',
+        uri: m[1].startsWith('http') ? m[1] : 'https://www.mod.go.jp' + m[1]
+      }))
+
+      // 番号: 1列目(index=0)
+      const num = cols[0] || ''
+
+      items.push({
+        resultId: `mod-dih-${num}-${isoDeadline}`,
+        projectName,
+        organizationName: '防衛省情報本部',
+        procedureType: '見積合わせ（随意契約）',
+        category: '役務',
+        cftIssueDate: isoDeadline,
+        tenderDeadline: isoDeadline,
+        url: mainPdfUrl,
+        prefectureName: '東京都',
+        source: '防衛省情報本部',
+        attachments,
+      })
+    }
+  } catch (e) {
+    // ignore
+  }
+  return items
+}
+
+// =============================
+// 防衛省（内局）APIエンドポイント
+// =============================
+app.get('/api/mod', async (c) => {
+  const query = (c.req.query('query') || '').toLowerCase()
+  const url = 'https://www.mod.go.jp/j/budget/chotatsu/naikyoku/mitsumori/index.html'
+  try {
+    const res = await fetch(url, { headers: { 'User-Agent': 'BidSearchApp/1.0' } })
+    const html = await res.text()
+    let items = scrapeMod(html, url)
+    if (query) items = items.filter(i => (i.projectName || '').includes(query))
+    return c.json({ totalHits: items.length, items, source: '防衛省（内局）' })
+  } catch (e) {
+    return c.json({ error: String(e), totalHits: 0, items: [] }, 500)
+  }
+})
+
+// =============================
+// 防衛省情報本部APIエンドポイント
+// =============================
+app.get('/api/mod-dih', async (c) => {
+  const query = (c.req.query('query') || '').toLowerCase()
+  const url = 'https://www.mod.go.jp/dih/supply/open-r8.html'
+  try {
+    const res = await fetch(url, { headers: { 'User-Agent': 'BidSearchApp/1.0' } })
+    const html = await res.text()
+    let items = scrapeModDih(html, url)
+    if (query) items = items.filter(i => (i.projectName || '').includes(query))
+    return c.json({ totalHits: items.length, items, source: '防衛省情報本部' })
+  } catch (e) {
+    return c.json({ error: String(e), totalHits: 0, items: [] }, 500)
+  }
+})
+
+// =============================
 // フロントエンド HTML配信（APIルートより後に定義）
 // =============================
 // ※ notify-check / notify-status は renderHTML() 関数定義後、
@@ -637,13 +799,27 @@ function renderHTML(): string {
       <i class="fas fa-piggy-bank w-4"></i> 企業年金連合会
     </a>
     <div class="border-t border-white/20 my-2"></div>
+    <p class="text-xs text-blue-300 px-4 py-1 font-medium uppercase tracking-wider">防衛省系</p>
+    <a href="#" onclick="showPage('mod')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-mod">
+      <i class="fas fa-shield-alt w-4"></i> 防衛省（内局）
+    </a>
+    <a href="#" onclick="showPage('mod-dih')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-mod-dih">
+      <i class="fas fa-satellite-dish w-4"></i> 防衛省情報本部
+    </a>
+    <a href="#" onclick="window.open('https://www.mod.go.jp/atla/data/info/ny_honbu/ippan.html','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-mod-atla">
+      <i class="fas fa-cogs w-4"></i> 防衛装備庁 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
+    </a>
+    <a href="#" onclick="window.open('https://www.mod.go.jp/gsdf/tercom/procurement.html','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-mod-gsdf">
+      <i class="fas fa-user-shield w-4"></i> 陸上自衛隊 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
+    </a>
+    <div class="border-t border-white/20 my-2"></div>
     <a href="#" onclick="showPage('notify')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-notify">
       <i class="fas fa-bell w-4"></i> メール通知設定
     </a>
   </nav>
   <div class="p-4 border-t border-white/20">
     <p class="text-xs text-blue-200 text-center">官公需ポータル・協会けんぽ</p>
-    <p class="text-xs text-blue-300 text-center mt-1">企業年金連合会 連携</p>
+    <p class="text-xs text-blue-300 text-center mt-1">企業年金連合会・防衛省系 連携</p>
   </div>
 </div>
 
@@ -952,20 +1128,82 @@ function renderHTML(): string {
       <div id="pfa-result-area"></div>
     </div>
 
-    <!-- 全ソース一括検索ページ -->
-    <div id="page-all" class="page-content hidden">
-      <div class="bg-gradient-to-br from-indigo-50 to-purple-50 border border-indigo-100 rounded-2xl p-6 mb-6">
+    <!-- 防衛省（内局）ページ -->
+    <div id="page-mod" class="page-content hidden">
+      <div class="bg-gradient-to-br from-slate-50 to-gray-100 border border-slate-200 rounded-2xl p-6 mb-6">
         <div class="flex items-start gap-4">
-          <div class="w-14 h-14 bg-indigo-100 rounded-2xl flex items-center justify-center flex-shrink-0">
-            <i class="fas fa-layer-group text-indigo-600 text-2xl"></i>
+          <div class="w-14 h-14 bg-slate-200 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-shield-alt text-slate-600 text-2xl"></i>
           </div>
           <div class="flex-1">
-            <h3 class="text-lg font-bold text-gray-800 mb-1">全ソース一括検索</h3>
-            <p class="text-sm text-gray-600">官公需ポータル・協会けんぽ・企業年金連合会の全ソースを横断して一括検索できます。</p>
+            <h3 class="text-lg font-bold text-gray-800 mb-1">防衛省（内局）調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">大臣官房会計課によるオープンカウンター方式の見積依頼情報を取得します。</p>
+            <div class="flex flex-wrap gap-2">
+              <a href="https://www.mod.go.jp/j/budget/chotatsu/naikyoku/mitsumori/index.html" target="_blank"
+                 class="text-xs bg-white border border-slate-300 text-slate-600 px-3 py-1.5 rounded-lg hover:bg-slate-50 flex items-center gap-1">
+                <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+              </a>
+            </div>
           </div>
         </div>
       </div>
-      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 mb-6">
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="mod-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-slate-300"
+              onkeypress="if(event.key==='Enter') loadMod()">
+          </div>
+          <button onclick="loadMod()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #475569, #334155);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="mod-result-area"></div>
+    </div>
+
+    <!-- 防衛省情報本部ページ -->
+    <div id="page-mod-dih" class="page-content hidden">
+      <div class="bg-gradient-to-br from-sky-50 to-cyan-50 border border-sky-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-sky-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-satellite-dish text-sky-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">防衛省情報本部 調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">防衛省情報本部（令和8年度）の随意契約見積情報を取得します。</p>
+            <div class="flex flex-wrap gap-2">
+              <a href="https://www.mod.go.jp/dih/supply/open-r8.html" target="_blank"
+                 class="text-xs bg-white border border-sky-200 text-sky-600 px-3 py-1.5 rounded-lg hover:bg-sky-50 flex items-center gap-1">
+                <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="mod-dih-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-sky-300"
+              onkeypress="if(event.key==='Enter') loadModDih()">
+          </div>
+          <button onclick="loadModDih()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #0284c7, #0369a1);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="mod-dih-result-area"></div>
+    </div>
+
+    <!-- 全ソース一括検索ページ -->
+    <div id="page-all" class="page-content hidden">
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
           <div class="md:col-span-2">
             <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
@@ -1118,6 +1356,8 @@ function showPage(page) {
     pfa: '企業年金連合会 調達情報',
     all: '全ソース一括検索',
     notify: 'メール通知設定',
+    mod: '防衛省（内局）調達情報',
+    'mod-dih': '防衛省情報本部 調達情報',
   };
   const subtitles = {
     dashboard: '官公需ポータル・協会けんぽ・企業年金連合会のリアルタイムデータ',
@@ -1130,6 +1370,8 @@ function showPage(page) {
     pfa: '企業年金連合会 公式サイトから直接取得',
     all: '官公需ポータル・協会けんぽ・企業年金連合会 3ソースを横断検索',
     notify: 'キーワード一致の新着案件をメールで自動通知',
+    mod: '防衛省大臣官房会計課 公式サイトから直接取得',
+    'mod-dih': '防衛省情報本部 公式サイトから直接取得',
   };
   document.getElementById('page-title').textContent = titles[page] || page;
   const subtitleEl = document.getElementById('page-subtitle');
@@ -1150,6 +1392,10 @@ function showPage(page) {
     loadKyoukaikenpo();
   } else if (page === 'pfa') {
     loadPfa();
+  } else if (page === 'mod') {
+    loadMod();
+  } else if (page === 'mod-dih') {
+    loadModDih();
   } else if (page === 'all') {
     loadAll();
   } else if (page === 'notify') {
@@ -1589,6 +1835,180 @@ async function loadPfa() {
       <div class="mt-4 text-center text-xs text-gray-400">
         <i class="fas fa-info-circle mr-1"></i>
         データ出典: <a href="https://www.pfa.or.jp/chotatsu/ichiran/index.html" target="_blank" class="text-blue-400 hover:underline">企業年金連合会 調達情報一覧</a>
+      </div>
+    \`;
+
+    area.innerHTML = html;
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+      <i class="fas fa-exclamation-triangle text-yellow-500 text-3xl mb-3"></i>
+      <p class="text-gray-600">取得に失敗しました</p>
+      <p class="text-xs text-gray-400 mt-1">\${e.message}</p>
+    </div>\`;
+  }
+}
+
+// ========================
+// 防衛省（内局）
+// ========================
+async function loadMod() {
+  const area = document.getElementById('mod-result-area');
+  const query = document.getElementById('mod-query').value.trim();
+
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">防衛省（内局）から調達情報を取得中...</p></div></div>\`;
+
+  try {
+    const params = {};
+    if (query) params.query = query;
+    const res = await axios.get('/api/mod', { params });
+    const data = res.data;
+
+    if (data.error || !data.items || data.items.length === 0) {
+      area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+        <i class="fas fa-search text-gray-300 text-4xl mb-4"></i>
+        <p class="text-gray-500 text-lg">\${data.error ? 'エラーが発生しました' : '案件が見つかりませんでした'}</p>
+        \${data.error ? \`<p class="text-xs text-gray-400 mt-1">\${escHtml(data.error)}</p>\` : ''}
+        <p class="text-xs text-gray-400 mt-2">
+          <a href="https://www.mod.go.jp/j/budget/chotatsu/naikyoku/mitsumori/index.html" target="_blank" class="text-blue-500 hover:underline">公式サイトで直接ご確認ください</a>
+        </p>
+      </div>\`;
+      return;
+    }
+
+    let html = \`
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100">
+        <div class="p-5 border-b border-gray-100 flex items-center justify-between">
+          <h3 class="font-bold text-gray-800 flex items-center gap-2">
+            <i class="fas fa-shield-alt text-slate-500"></i>
+            見積依頼案件一覧
+            <span class="ml-2 text-xs bg-slate-50 text-slate-600 px-2 py-0.5 rounded-full font-normal">
+              \${data.totalHits} 件
+            </span>
+          </h3>
+        </div>
+        <div class="divide-y divide-gray-50">
+    \`;
+
+    data.items.forEach(item => {
+      const issueDate = formatDisplayDate(item.cftIssueDate);
+      const deadline = formatDisplayDate(item.tenderDeadline);
+      html += \`
+        <div class="px-5 py-4 hover:bg-slate-50 transition-colors cursor-pointer" onclick='showModal(\${JSON.stringify(item).replace(/'/g, "\\\\'")})'>\`
+        + \`
+          <div class="flex items-start justify-between gap-4">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 mb-1">
+                \${issueDate ? \`<span class="text-xs text-gray-400"><i class="fas fa-calendar mr-1"></i>\${issueDate}</span>\` : ''}
+                <span class="tag bg-slate-50 text-slate-700 border border-slate-200 text-xs">見積合わせ</span>
+              </div>
+              <p class="font-medium text-gray-800 text-sm leading-snug">\${escHtml(item.projectName)}</p>
+              <p class="text-xs text-gray-500 mt-1">\${escHtml(item.organizationName)}</p>
+              \${deadline ? \`<p class="text-xs text-orange-500 mt-0.5"><i class="fas fa-clock mr-1"></i>提出期限: \${deadline}</p>\` : ''}
+            </div>
+            <div class="flex items-center gap-2 flex-shrink-0">
+              \${(item.url && item.url.endsWith('.pdf')) ? \`
+                <a href="\${escHtml(item.url)}" target="_blank" onclick="event.stopPropagation()"
+                   class="text-xs bg-red-50 text-red-600 border border-red-200 px-2.5 py-1 rounded-lg hover:bg-red-100 flex items-center gap-1">
+                  <i class="fas fa-file-pdf"></i> PDF
+                </a>
+              \` : ''}
+              <i class="fas fa-chevron-right text-gray-300 text-xs"></i>
+            </div>
+          </div>
+        </div>
+      \`;
+    });
+
+    html += \`</div></div>
+      <div class="mt-4 text-center text-xs text-gray-400">
+        <i class="fas fa-info-circle mr-1"></i>
+        データ出典: <a href="https://www.mod.go.jp/j/budget/chotatsu/naikyoku/mitsumori/index.html" target="_blank" class="text-blue-400 hover:underline">防衛省 大臣官房会計課 見積依頼</a>
+      </div>
+    \`;
+
+    area.innerHTML = html;
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+      <i class="fas fa-exclamation-triangle text-yellow-500 text-3xl mb-3"></i>
+      <p class="text-gray-600">取得に失敗しました</p>
+      <p class="text-xs text-gray-400 mt-1">\${e.message}</p>
+    </div>\`;
+  }
+}
+
+// ========================
+// 防衛省情報本部
+// ========================
+async function loadModDih() {
+  const area = document.getElementById('mod-dih-result-area');
+  const query = document.getElementById('mod-dih-query').value.trim();
+
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">防衛省情報本部から調達情報を取得中...</p></div></div>\`;
+
+  try {
+    const params = {};
+    if (query) params.query = query;
+    const res = await axios.get('/api/mod-dih', { params });
+    const data = res.data;
+
+    if (data.error || !data.items || data.items.length === 0) {
+      area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+        <i class="fas fa-search text-gray-300 text-4xl mb-4"></i>
+        <p class="text-gray-500 text-lg">\${data.error ? 'エラーが発生しました' : '案件が見つかりませんでした'}</p>
+        \${data.error ? \`<p class="text-xs text-gray-400 mt-1">\${escHtml(data.error)}</p>\` : ''}
+        <p class="text-xs text-gray-400 mt-2">
+          <a href="https://www.mod.go.jp/dih/supply/open-r8.html" target="_blank" class="text-blue-500 hover:underline">公式サイトで直接ご確認ください</a>
+        </p>
+      </div>\`;
+      return;
+    }
+
+    let html = \`
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100">
+        <div class="p-5 border-b border-gray-100 flex items-center justify-between">
+          <h3 class="font-bold text-gray-800 flex items-center gap-2">
+            <i class="fas fa-satellite-dish text-sky-500"></i>
+            見積依頼案件一覧
+            <span class="ml-2 text-xs bg-sky-50 text-sky-600 px-2 py-0.5 rounded-full font-normal">
+              \${data.totalHits} 件
+            </span>
+          </h3>
+        </div>
+        <div class="divide-y divide-gray-50">
+    \`;
+
+    data.items.forEach(item => {
+      const deadline = formatDisplayDate(item.tenderDeadline);
+      html += \`
+        <div class="px-5 py-4 hover:bg-sky-50 transition-colors cursor-pointer" onclick='showModal(\${JSON.stringify(item).replace(/'/g, "\\\\'")})'>\`
+        + \`
+          <div class="flex items-start justify-between gap-4">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 mb-1">
+                \${deadline ? \`<span class="text-xs text-orange-500"><i class="fas fa-clock mr-1"></i>見積期限: \${deadline}</span>\` : ''}
+                <span class="tag bg-sky-50 text-sky-700 border border-sky-200 text-xs">見積合わせ</span>
+              </div>
+              <p class="font-medium text-gray-800 text-sm leading-snug">\${escHtml(item.projectName)}</p>
+              <p class="text-xs text-gray-500 mt-1">\${escHtml(item.organizationName)}</p>
+            </div>
+            <div class="flex items-center gap-2 flex-shrink-0">
+              \${(item.url && item.url.endsWith('.pdf')) ? \`
+                <a href="\${escHtml(item.url)}" target="_blank" onclick="event.stopPropagation()"
+                   class="text-xs bg-red-50 text-red-600 border border-red-200 px-2.5 py-1 rounded-lg hover:bg-red-100 flex items-center gap-1">
+                  <i class="fas fa-file-pdf"></i> PDF
+                </a>
+              \` : ''}
+              <i class="fas fa-chevron-right text-gray-300 text-xs"></i>
+            </div>
+          </div>
+        </div>
+      \`;
+    });
+
+    html += \`</div></div>
+      <div class="mt-4 text-center text-xs text-gray-400">
+        <i class="fas fa-info-circle mr-1"></i>
+        データ出典: <a href="https://www.mod.go.jp/dih/supply/open-r8.html" target="_blank" class="text-blue-400 hover:underline">防衛省情報本部 随意契約見積依頼</a>
       </div>
     \`;
 
