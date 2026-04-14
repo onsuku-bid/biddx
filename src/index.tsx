@@ -940,6 +940,10 @@ function renderHTML(): string {
       <i class="fas fa-user-shield w-4"></i> 陸上自衛隊 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
     </a>
     <div class="border-t border-white/20 my-2"></div>
+    <a href="#" onclick="showPage('bookmark')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-bookmark">
+      <i class="fas fa-star w-4"></i> ブックマーク
+      <span id="bookmark-count-badge" class="ml-auto bg-yellow-400 text-yellow-900 text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
+    </a>
     <a href="#" onclick="showPage('notify')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-notify">
       <i class="fas fa-bell w-4"></i> メール通知設定
     </a>
@@ -1365,6 +1369,27 @@ function renderHTML(): string {
     </div>
 
     <!-- メール通知設定ページ -->
+    <!-- ブックマークページ -->
+    <div id="page-bookmark" class="page-content hidden">
+      <!-- ヘッダーカード -->
+      <div class="bg-gradient-to-br from-yellow-50 to-amber-50 border border-yellow-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-yellow-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-star text-yellow-500 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">ブックマーク</h3>
+            <p class="text-sm text-gray-600">気になる案件を保存しておけます。このPCのブラウザに保存されます。</p>
+          </div>
+          <button onclick="clearAllBookmarks()" class="text-xs text-red-400 hover:text-red-600 border border-red-200 hover:border-red-400 px-3 py-1.5 rounded-lg transition-all">
+            <i class="fas fa-trash mr-1"></i>すべて削除
+          </button>
+        </div>
+      </div>
+      <!-- ブックマーク一覧 -->
+      <div id="bookmark-list-area"></div>
+    </div>
+
     <div id="page-notify" class="page-content hidden">
 
       <!-- ヘッダーカード -->
@@ -1584,6 +1609,7 @@ function showPage(page) {
     kyoukaikenpo: '協会けんぽ 調達情報',
     pfa: '企業年金連合会 調達情報',
     all: '全ソース一括検索',
+    bookmark: 'ブックマーク',
     notify: 'メール通知設定',
     mod: '防衛省（内局）調達情報',
     'mod-dih': '防衛省情報本部 調達情報',
@@ -1598,6 +1624,7 @@ function showPage(page) {
     kyoukaikenpo: '全国健康保険協会 公式サイトから直接取得',
     pfa: '企業年金連合会 公式サイトから直接取得',
     all: '官公需ポータル・協会けんぽ・企業年金連合会 3ソースを横断検索',
+    bookmark: 'ブラウザのlocalStorageに保存（このPCのみ）',
     notify: 'キーワード一致の新着案件をメールで自動通知',
     mod: '防衛省大臣官房会計課 公式サイトから直接取得',
     'mod-dih': '防衛省情報本部 公式サイトから直接取得',
@@ -1627,6 +1654,8 @@ function showPage(page) {
     loadModDih();
   } else if (page === 'all') {
     loadAll();
+  } else if (page === 'bookmark') {
+    renderBookmarkPage();
   } else if (page === 'notify') {
     loadNotifyStatus();
   }
@@ -1833,6 +1862,124 @@ function toggleClosedItems(areaId) {
   renderResults(areaId, { items: searchResults, totalHits: searchResults.length }, '検索結果');
 }
 
+// ========================
+// ブックマーク機能
+// ========================
+const BOOKMARK_KEY = 'biddx_bookmarks';
+
+function getBookmarks() {
+  try {
+    return JSON.parse(localStorage.getItem(BOOKMARK_KEY) || '[]');
+  } catch { return []; }
+}
+
+function saveBookmarks(bookmarks) {
+  localStorage.setItem(BOOKMARK_KEY, JSON.stringify(bookmarks));
+  updateBookmarkBadge();
+}
+
+function getBookmarkId(item) {
+  return item.resultId || item.url || item.projectName || '';
+}
+
+function isBookmarked(item) {
+  const id = getBookmarkId(item);
+  if (!id) return false;
+  return getBookmarks().some(b => getBookmarkId(b) === id);
+}
+
+function toggleBookmark(item) {
+  const id = getBookmarkId(item);
+  if (!id) return;
+  let bookmarks = getBookmarks();
+  const idx = bookmarks.findIndex(b => getBookmarkId(b) === id);
+  if (idx >= 0) {
+    bookmarks.splice(idx, 1);
+  } else {
+    bookmarks.unshift({ ...item, bookmarkedAt: new Date().toISOString() });
+  }
+  saveBookmarks(bookmarks);
+  // ブックマークボタンのアイコンを更新
+  document.querySelectorAll(\`.bookmark-btn[data-id="\${CSS.escape(id)}"]\`).forEach(btn => {
+    const bookmarked = bookmarks.some(b => getBookmarkId(b) === id);
+    btn.innerHTML = bookmarked
+      ? '<i class="fas fa-star text-yellow-400"></i>'
+      : '<i class="far fa-star text-gray-300 hover:text-yellow-400"></i>';
+    btn.title = bookmarked ? 'ブックマーク解除' : 'ブックマークに追加';
+  });
+}
+
+function clearAllBookmarks() {
+  if (!confirm('すべてのブックマークを削除しますか？')) return;
+  saveBookmarks([]);
+  renderBookmarkPage();
+}
+
+function updateBookmarkBadge() {
+  const count = getBookmarks().length;
+  const badge = document.getElementById('bookmark-count-badge');
+  if (!badge) return;
+  if (count > 0) {
+    badge.textContent = count;
+    badge.classList.remove('hidden');
+  } else {
+    badge.classList.add('hidden');
+  }
+}
+
+function renderBookmarkPage() {
+  const area = document.getElementById('bookmark-list-area');
+  if (!area) return;
+  const bookmarks = getBookmarks();
+
+  if (bookmarks.length === 0) {
+    area.innerHTML = \`
+      <div class="text-center py-20 bg-white rounded-2xl border border-gray-100">
+        <i class="far fa-star text-gray-200 text-5xl mb-4"></i>
+        <p class="text-gray-500 text-lg font-medium">ブックマークはありません</p>
+        <p class="text-xs text-gray-400 mt-2">案件一覧の ☆ アイコンをクリックして追加できます</p>
+      </div>\`;
+    return;
+  }
+
+  // 締切済みフィルタ
+  const activeItems = showClosedItems ? bookmarks : bookmarks.filter(item => !isItemClosed(item));
+  const closedCount = bookmarks.length - activeItems.length;
+
+  let html = \`
+    <div class="bg-white rounded-2xl shadow-sm border border-gray-100 mb-6">
+      <div class="p-4 border-b border-gray-100 flex items-center justify-between flex-wrap gap-2">
+        <h3 class="font-bold text-gray-800 text-sm flex items-center gap-2">
+          <i class="fas fa-star text-yellow-400"></i>
+          保存済み案件
+          <span class="ml-2 text-xs bg-yellow-50 text-yellow-600 px-2 py-0.5 rounded-full font-normal">
+            \${activeItems.length} 件
+            \${closedCount > 0 ? \`<span class="text-gray-400 ml-1">（締切済み \${closedCount} 件非表示）</span>\` : ''}
+          </span>
+        </h3>
+        \${closedCount > 0 ? \`
+        <button onclick="showClosedItems=!showClosedItems; renderBookmarkPage();" class="text-xs px-3 py-1.5 border rounded-lg \${showClosedItems ? 'bg-gray-200 text-gray-700 border-gray-300' : 'text-gray-500 hover:text-blue-600 border-gray-200 hover:border-blue-300'}">
+          <i class="fas fa-eye\${showClosedItems ? '-slash' : ''} mr-1"></i>\${showClosedItems ? '締切済みを隠す' : '締切済みも表示'}
+        </button>\` : ''}
+      </div>
+      <div class="divide-y divide-gray-50">\`;
+
+  if (activeItems.length === 0 && closedCount > 0) {
+    html += \`<div class="text-center py-12">
+      <i class="fas fa-check-circle text-gray-300 text-4xl mb-4"></i>
+      <p class="text-gray-500">募集中のブックマークはありません</p>
+      <button onclick="showClosedItems=true; renderBookmarkPage();" class="mt-3 text-xs text-blue-600 hover:underline">締切済みも表示する</button>
+    </div>\`;
+  } else {
+    activeItems.forEach(item => {
+      html += renderListItem(item);
+    });
+  }
+
+  html += \`</div></div>\`;
+  area.innerHTML = html;
+}
+
 function renderListItem(item) {
   const catBadge = getCategoryBadge(item.category);
   const procBadge = item.procedureType ? \`<span class="tag bg-gray-100 text-gray-600">\${item.procedureType}</span>\` : '';
@@ -1843,12 +1990,14 @@ function renderListItem(item) {
   const { status } = getDeadlineStatus(item);
   const deadlineBadge = renderDeadlineBadge(item);
   const isClosed = status === 'closed';
+  const bookmarked = isBookmarked(item);
+  const itemId = getBookmarkId(item);
+  const itemJson = JSON.stringify(item).replace(/'/g, "\\\\'");
 
   return \`
-    <div class="result-row px-6 py-4 cursor-pointer\${isClosed ? ' opacity-50' : ''}" onclick='showModal(\${JSON.stringify(item).replace(/'/g, "\\\\'")})'>\`
-    + \`
+    <div class="result-row px-6 py-4\${isClosed ? ' opacity-50' : ''}">
       <div class="flex items-start justify-between gap-4">
-        <div class="flex-1 min-w-0">
+        <div class="flex-1 min-w-0 cursor-pointer" onclick='showModal(\${itemJson})'>
           <div class="flex flex-wrap items-center gap-2 mb-2">
             \${catBadge}
             \${procBadge}
@@ -1865,8 +2014,18 @@ function renderListItem(item) {
             \${openDate ? \`<span><i class="fas fa-gavel mr-1 text-gray-400"></i>開札: \${openDate}</span>\` : ''}
           </div>
         </div>
-        <div class="flex-shrink-0">
-          <i class="fas fa-chevron-right text-gray-300 text-sm mt-1"></i>
+        <div class="flex-shrink-0 flex items-center gap-2">
+          <button
+            class="bookmark-btn p-2 rounded-lg hover:bg-yellow-50 transition-all"
+            data-id="\${escHtml(itemId)}"
+            title="\${bookmarked ? 'ブックマーク解除' : 'ブックマークに追加'}"
+            onclick="event.stopPropagation(); toggleBookmark(\${itemJson}); if(currentPage==='bookmark') renderBookmarkPage();"
+          >
+            \${bookmarked
+              ? '<i class="fas fa-star text-yellow-400"></i>'
+              : '<i class="far fa-star text-gray-300 hover:text-yellow-400"></i>'}
+          </button>
+          <i class="fas fa-chevron-right text-gray-300 text-sm cursor-pointer" onclick='showModal(\${itemJson})'></i>
         </div>
       </div>
     </div>
@@ -2673,6 +2832,7 @@ async function runNotifyCheck() {
 // ========================
 if (isLoggedIn()) {
   showApp();
+  updateBookmarkBadge();
   loadDashboard();
 } else {
   showLogin();
