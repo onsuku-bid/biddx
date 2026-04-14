@@ -117,7 +117,8 @@ app.post('/api/login', async (c) => {
 // =============================
 
 app.get('/api/pfa', async (c) => {
-  const keyword = (c.req.query('keyword') || '').toLowerCase()
+  const keyword = c.req.query('keyword') || c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
   try {
     const res = await fetch('https://www.pfa.or.jp/chotatsu/ichiran/index.html', {
       headers: { 'User-Agent': 'BidSearchApp/1.0' }
@@ -129,7 +130,7 @@ app.get('/api/pfa', async (c) => {
     let items = scrapePfa(html)
 
     if (keyword) {
-      items = items.filter(i => i.projectName.toLowerCase().includes(keyword))
+      items = filterItemsByKeyword(items, keyword, searchFields)
     }
 
     return c.json({ source: '企業年金連合会', totalHits: items.length, items })
@@ -237,6 +238,7 @@ function convertJapaneseDate(dateStr: string): string {
 app.get('/api/search-all', async (c) => {
   const keyword = c.req.query('keyword') || ''
   const sources = (c.req.query('sources') || 'kkj,kyoukaikenpo,pfa').split(',')
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
 
   const results: any[] = []
   const errors: Record<string, string> = {}
@@ -251,10 +253,9 @@ app.get('/api/search-all', async (c) => {
         })
         const xml = await res.text()
         const parsed = parseKkjXml(xml)
-        ;(parsed.items || []).forEach((item: any) => {
-          item.source = '官公需ポータル'
-          results.push(item)
-        })
+        let items = (parsed.items || []).map((item: any) => ({ ...item, source: '官公需ポータル' }))
+        if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
+        results.push(...items)
       } catch(e) { errors['kkj'] = String(e) }
     })() : Promise.resolve(),
 
@@ -266,8 +267,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapeKyoukaikenpo(html, 'https://www.kyoukaikenpo.or.jp/disclosure/procurement/')
-        const kw = keyword.toLowerCase()
-        const filtered = kw ? items.filter(i => i.projectName.toLowerCase().includes(kw)) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
         results.push(...filtered)
       } catch(e) { errors['kyoukaikenpo'] = String(e) }
     })() : Promise.resolve(),
@@ -280,8 +280,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapePfa(html)
-        const kw = keyword.toLowerCase()
-        const filtered = kw ? items.filter(i => i.projectName.toLowerCase().includes(kw)) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
         results.push(...filtered)
       } catch(e) { errors['pfa'] = String(e) }
     })() : Promise.resolve(),
@@ -367,12 +366,23 @@ app.get('/api/search', async (c) => {
     const xmlText = await response.text()
     const parsed = parseKkjXml(xmlText)
 
-    // 案件名のみでフィルタリング（案①：精度向上）
+    // 検索対象フィールドとAND検索フィルタリング
     if (query && parsed.items) {
-      const lowerQuery = query.toLowerCase()
-      parsed.items = (parsed.items as any[]).filter((item: any) =>
-        (item.projectName || '').toLowerCase().includes(lowerQuery)
-      )
+      // 検索対象フィールド（カンマ区切り: name, desc, org）
+      const searchFields = (c.req.query('searchFields') || 'name').split(',')
+      // スペース区切りでAND検索（全角・半角スペース対応）
+      const keywords = query.toLowerCase().split(/[\s　]+/).filter(k => k.length > 0)
+
+      parsed.items = (parsed.items as any[]).filter((item: any) => {
+        // 検索対象テキストを結合
+        const targets: string[] = []
+        if (searchFields.includes('name')) targets.push((item.projectName || '').toLowerCase())
+        if (searchFields.includes('desc')) targets.push((item.projectDescription || '').toLowerCase())
+        if (searchFields.includes('org')) targets.push((item.organizationName || '').toLowerCase())
+        const combined = targets.join(' ')
+        // 全キーワードが含まれていればAND一致
+        return keywords.every(kw => combined.includes(kw))
+      })
       parsed.totalHits = parsed.items.length
     }
 
@@ -534,10 +544,11 @@ app.get('/api/kyoukaikenpo', async (c) => {
     const label = archive ? `協会けんぽ (${archive})` : '協会けんぽ (公開中)'
     const items = parseKyoukaikenpoHtml(html, label)
 
-    // キーワードフィルタ（案件名のみ）
+    // キーワードフィルタ（AND検索・検索対象選択対応）
     const query = c.req.query('query') || ''
+    const searchFields = (c.req.query('searchFields') || 'name').split(',')
     const filtered = query
-      ? items.filter(i => (i.projectName || '').includes(query))
+      ? filterItemsByKeyword(items, query, searchFields)
       : items
 
     return c.json({ totalHits: filtered.length, items: filtered, source: '協会けんぽ' })
@@ -639,6 +650,24 @@ function formatDate(date: Date): string {
   const m = String(date.getMonth() + 1).padStart(2, '0')
   const d = String(date.getDate()).padStart(2, '0')
   return `${y}-${m}-${d}`
+}
+
+// =============================
+// 共通キーワードフィルタ（AND検索・検索対象選択対応）
+// searchFields: ['name', 'desc', 'org'] の組み合わせ
+// query: スペース区切りでAND検索
+// =============================
+function filterItemsByKeyword(items: any[], query: string, searchFields: string[]): any[] {
+  if (!query) return items
+  const keywords = query.toLowerCase().split(/[\s　]+/).filter(k => k.length > 0)
+  return items.filter(item => {
+    const targets: string[] = []
+    if (searchFields.includes('name')) targets.push((item.projectName || '').toLowerCase())
+    if (searchFields.includes('desc')) targets.push((item.projectDescription || '').toLowerCase())
+    if (searchFields.includes('org')) targets.push((item.organizationName || '').toLowerCase())
+    const combined = targets.join(' ')
+    return keywords.every(kw => combined.includes(kw))
+  })
 }
 
 // =============================
@@ -773,13 +802,14 @@ function scrapeModDih(html: string, baseUrl: string): any[] {
 // 防衛省（内局）APIエンドポイント
 // =============================
 app.get('/api/mod', async (c) => {
-  const query = (c.req.query('query') || '').toLowerCase()
+  const query = c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
   const url = 'https://www.mod.go.jp/j/budget/chotatsu/naikyoku/mitsumori/index.html'
   try {
     const res = await fetch(url, { headers: { 'User-Agent': 'BidSearchApp/1.0' } })
     const html = await res.text()
     let items = scrapeMod(html, url)
-    if (query) items = items.filter(i => (i.projectName || '').includes(query))
+    if (query) items = filterItemsByKeyword(items, query, searchFields)
     return c.json({ totalHits: items.length, items, source: '防衛省（内局）' })
   } catch (e) {
     return c.json({ error: String(e), totalHits: 0, items: [] }, 500)
@@ -790,13 +820,14 @@ app.get('/api/mod', async (c) => {
 // 防衛省情報本部APIエンドポイント
 // =============================
 app.get('/api/mod-dih', async (c) => {
-  const query = (c.req.query('query') || '').toLowerCase()
+  const query = c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
   const url = 'https://www.mod.go.jp/dih/supply/open-r8.html'
   try {
     const res = await fetch(url, { headers: { 'User-Agent': 'BidSearchApp/1.0' } })
     const html = await res.text()
     let items = scrapeModDih(html, url)
-    if (query) items = items.filter(i => (i.projectName || '').includes(query))
+    if (query) items = filterItemsByKeyword(items, query, searchFields)
     return c.json({ totalHits: items.length, items, source: '防衛省情報本部' })
   } catch (e) {
     return c.json({ error: String(e), totalHits: 0, items: [] }, 500)
@@ -1142,6 +1173,26 @@ function renderHTML(): string {
             <input id="s-date-to" type="date" class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-300">
           </div>
         </div>
+        <!-- 検索対象・AND検索オプション -->
+        <div class="bg-gray-50 rounded-xl px-4 py-3 mb-4 flex flex-wrap items-center gap-4">
+          <div class="flex items-center gap-1 text-xs font-medium text-gray-600">
+            <i class="fas fa-sliders-h text-blue-500 mr-1"></i>検索対象：
+          </div>
+          <label class="flex items-center gap-1.5 text-xs text-gray-700 cursor-pointer">
+            <input type="checkbox" id="sf-name" checked class="accent-blue-500"> 案件名
+          </label>
+          <label class="flex items-center gap-1.5 text-xs text-gray-700 cursor-pointer">
+            <input type="checkbox" id="sf-desc" class="accent-blue-500"> 説明文
+            <span class="text-gray-400">（官公需ポータルのみ）</span>
+          </label>
+          <label class="flex items-center gap-1.5 text-xs text-gray-700 cursor-pointer">
+            <input type="checkbox" id="sf-org" class="accent-blue-500"> 機関名
+          </label>
+          <div class="border-l border-gray-300 pl-4 flex items-center gap-1.5 text-xs text-gray-500">
+            <i class="fas fa-info-circle text-blue-400"></i>
+            スペース区切りで<strong class="text-gray-700">AND検索</strong>（例：「動画制作 東京都」）
+          </div>
+        </div>
         <div class="flex items-center gap-3">
           <button onclick="doSearch()" class="btn-primary text-white px-8 py-2.5 rounded-xl font-medium text-sm shadow-md flex items-center gap-2">
             <i class="fas fa-search"></i> 検索する
@@ -1358,6 +1409,26 @@ function renderHTML(): string {
                 <input type="checkbox" id="src-pfa" checked class="rounded text-amber-600"> 企業年金連合会
               </label>
             </div>
+          </div>
+        </div>
+        <!-- 検索対象・AND検索オプション -->
+        <div class="bg-gray-50 rounded-xl px-4 py-3 mb-4 flex flex-wrap items-center gap-4">
+          <div class="flex items-center gap-1 text-xs font-medium text-gray-600">
+            <i class="fas fa-sliders-h text-indigo-500 mr-1"></i>検索対象：
+          </div>
+          <label class="flex items-center gap-1.5 text-xs text-gray-700 cursor-pointer">
+            <input type="checkbox" id="all-sf-name" checked class="accent-indigo-500"> 案件名
+          </label>
+          <label class="flex items-center gap-1.5 text-xs text-gray-700 cursor-pointer">
+            <input type="checkbox" id="all-sf-desc" class="accent-indigo-500"> 説明文
+            <span class="text-gray-400">（官公需ポータルのみ）</span>
+          </label>
+          <label class="flex items-center gap-1.5 text-xs text-gray-700 cursor-pointer">
+            <input type="checkbox" id="all-sf-org" class="accent-indigo-500"> 機関名
+          </label>
+          <div class="border-l border-gray-300 pl-4 flex items-center gap-1.5 text-xs text-gray-500">
+            <i class="fas fa-info-circle text-indigo-400"></i>
+            スペース区切りで<strong class="text-gray-700">AND検索</strong>
           </div>
         </div>
         <button onclick="loadAll()"
@@ -1743,11 +1814,17 @@ async function doSearch() {
   const dateTo = document.getElementById('s-date-to').value;
   const count = document.getElementById('s-count').value;
 
+  // 検索対象フィールドを取得
+  const sfName = document.getElementById('sf-name')?.checked;
+  const sfDesc = document.getElementById('sf-desc')?.checked;
+  const sfOrg  = document.getElementById('sf-org')?.checked;
+  const searchFields = [sfName && 'name', sfDesc && 'desc', sfOrg && 'org'].filter(Boolean).join(',') || 'name';
+
   const area = document.getElementById('search-result-area');
   area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">検索中...</p></div></div>\`;
 
   try {
-    const params = { count };
+    const params = { count, searchFields };
     if (query) params.query = query;
     if (orgName) params.orgName = orgName;
     if (lgCode) params.lgCode = lgCode;
@@ -2465,7 +2542,12 @@ async function loadAll() {
     if (useSrcKkp) sources.push('kyoukaikenpo');
     if (useSrcPfa) sources.push('pfa');
 
-    const params = { sources: sources.join(',') };
+    const allSfName = document.getElementById('all-sf-name')?.checked;
+    const allSfDesc = document.getElementById('all-sf-desc')?.checked;
+    const allSfOrg  = document.getElementById('all-sf-org')?.checked;
+    const searchFields = [allSfName && 'name', allSfDesc && 'desc', allSfOrg && 'org'].filter(Boolean).join(',') || 'name';
+
+    const params = { sources: sources.join(','), searchFields };
     if (query) params.keyword = query;
 
     const res = await axios.get('/api/search-all', { params });
