@@ -3109,10 +3109,12 @@ async function runNotifyCheck(env: {
     errors.push(`企業年金連合会: ${String(e)}`)
   }
 
-  // キーワードフィルタリング & 新着判定（案件名のみ）
+  // キーワードフィルタリング & 新着判定（案件名＋説明文＋機関名）
   for (const kw of keywords) {
     const matched = allItems.filter(item =>
-      (item.projectName || '').includes(kw)
+      (item.projectName || '').includes(kw) ||
+      (item.projectDescription || '').includes(kw) ||
+      (item.organizationName || '').includes(kw)
     )
 
     const seenIds = getSeenIds(kw)
