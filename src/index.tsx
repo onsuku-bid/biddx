@@ -7,6 +7,52 @@ type Bindings = {
   NOTIFY_EMAILS: string
   NOTIFY_KEYWORDS: string
   NOTIFY_SECRET: string
+  APP_PASSWORD: string
+}
+
+// =============================
+// JWT ユーティリティ (Web Crypto API)
+// =============================
+async function createJwt(payload: Record<string, any>, secret: string): Promise<string> {
+  const header = { alg: 'HS256', typ: 'JWT' }
+  const encode = (obj: any) => btoa(JSON.stringify(obj)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
+  const headerB64 = encode(header)
+  const payloadB64 = encode(payload)
+  const data = `${headerB64}.${payloadB64}`
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data))
+  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
+  return `${data}.${sigB64}`
+}
+
+async function verifyJwt(token: string, secret: string): Promise<Record<string, any> | null> {
+  try {
+    const parts = token.split('.')
+    if (parts.length !== 3) return null
+    const [headerB64, payloadB64, sigB64] = parts
+    const data = `${headerB64}.${payloadB64}`
+    const key = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['verify']
+    )
+    const sigBytes = Uint8Array.from(atob(sigB64.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0))
+    const valid = await crypto.subtle.verify('HMAC', key, sigBytes, new TextEncoder().encode(data))
+    if (!valid) return null
+    const payload = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')))
+    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null
+    return payload
+  } catch {
+    return null
+  }
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -16,6 +62,55 @@ app.use('/api/*', cors())
 
 // 静的ファイルの提供
 app.use('/static/*', serveStatic({ root: './' }))
+
+// =============================
+// 認証ミドルウェア（/api/login 以外のAPIを保護）
+// =============================
+app.use('/api/*', async (c, next) => {
+  // 認証不要のパス
+  const openPaths = ['/api/login', '/api/notify-check']
+  if (openPaths.some(p => c.req.path.startsWith(p))) {
+    return next()
+  }
+  const authHeader = c.req.header('Authorization') || ''
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : ''
+  if (!token) {
+    return c.json({ error: '認証が必要です', code: 'UNAUTHORIZED' }, 401)
+  }
+  const secret = c.env.APP_PASSWORD || 'biddx-default-secret'
+  const payload = await verifyJwt(token, secret)
+  if (!payload) {
+    return c.json({ error: 'トークンが無効または期限切れです', code: 'INVALID_TOKEN' }, 401)
+  }
+  return next()
+})
+
+// =============================
+// ログインAPI
+// =============================
+app.post('/api/login', async (c) => {
+  try {
+    const body = await c.req.json()
+    const password = body.password || ''
+    const appPassword = c.env.APP_PASSWORD || 'biddx-default-secret'
+
+    if (!password || password !== appPassword) {
+      return c.json({ error: 'パスワードが正しくありません' }, 401)
+    }
+
+    // JWT生成（24時間有効）
+    const payload = {
+      sub: 'user',
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24,
+    }
+    const token = await createJwt(payload, appPassword)
+
+    return c.json({ token, expiresIn: 86400 })
+  } catch (e) {
+    return c.json({ error: 'ログイン処理に失敗しました' }, 500)
+  }
+})
 
 // =============================
 // 企業年金連合会 スクレイピングAPI
@@ -755,6 +850,38 @@ function renderHTML(): string {
 </head>
 <body class="bg-gray-50 min-h-screen">
 
+<!-- ログインオーバーレイ -->
+<div id="login-overlay" class="fixed inset-0 z-50 flex items-center justify-center hidden" style="background: linear-gradient(135deg, #1e3a5f 0%, #2563eb 100%);">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm mx-4 overflow-hidden">
+    <div class="gradient-bg p-8 text-center">
+      <div class="w-16 h-16 bg-white/20 rounded-2xl flex items-center justify-center mx-auto mb-4">
+        <i class="fas fa-gavel text-white text-3xl"></i>
+      </div>
+      <h1 class="text-2xl font-bold text-white">入札DX</h1>
+      <p class="text-blue-200 text-sm mt-1">官公需情報検索システム</p>
+    </div>
+    <div class="p-8">
+      <h2 class="text-lg font-bold text-gray-800 mb-6 text-center">ログイン</h2>
+      <div id="login-error" class="hidden mb-4 bg-red-50 border border-red-200 text-red-600 text-sm rounded-xl px-4 py-3">
+        <i class="fas fa-exclamation-circle mr-2"></i><span id="login-error-msg"></span>
+      </div>
+      <div class="mb-4">
+        <label class="block text-xs font-medium text-gray-600 mb-1">パスワード</label>
+        <input
+          id="login-password"
+          type="password"
+          placeholder="パスワードを入力"
+          class="w-full px-4 py-3 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
+          onkeypress="if(event.key==='Enter') doLogin()"
+        >
+      </div>
+      <button onclick="doLogin()" id="login-btn" class="w-full btn-primary text-white py-3 rounded-xl font-medium text-sm shadow-md">
+        <i class="fas fa-sign-in-alt mr-2"></i>ログイン
+      </button>
+    </div>
+  </div>
+</div>
+
 <!-- サイドバー -->
 <div id="sidebar" class="fixed left-0 top-0 h-full w-64 gradient-bg text-white z-30 flex flex-col shadow-2xl">
   <div class="p-6 border-b border-white/20">
@@ -818,8 +945,11 @@ function renderHTML(): string {
     </a>
   </nav>
   <div class="p-4 border-t border-white/20">
-    <p class="text-xs text-blue-200 text-center">官公需ポータル・協会けんぽ</p>
-    <p class="text-xs text-blue-300 text-center mt-1">企業年金連合会・防衛省系 連携</p>
+    <button onclick="doLogout()" class="w-full flex items-center justify-center gap-2 text-xs text-blue-200 hover:text-white hover:bg-white/10 rounded-lg py-2 px-3 transition-all">
+      <i class="fas fa-sign-out-alt"></i> ログアウト
+    </button>
+    <p class="text-xs text-blue-300 text-center mt-2">官公需ポータル・協会けんぽ</p>
+    <p class="text-xs text-blue-300 text-center">企業年金連合会・防衛省系 連携</p>
   </div>
 </div>
 
@@ -1328,10 +1458,109 @@ function renderHTML(): string {
 
 <script>
 // ========================
+// 認証管理
+// ========================
+const TOKEN_KEY = 'biddx_token';
+
+function getToken() {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+function setToken(token) {
+  localStorage.setItem(TOKEN_KEY, token);
+}
+
+function clearToken() {
+  localStorage.removeItem(TOKEN_KEY);
+}
+
+function isLoggedIn() {
+  const token = getToken();
+  if (!token) return false;
+  // JWTのペイロードをデコードして期限確認
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+    return payload.exp > Math.floor(Date.now() / 1000);
+  } catch {
+    return false;
+  }
+}
+
+function authHeaders() {
+  const token = getToken();
+  return token ? { Authorization: 'Bearer ' + token } : {};
+}
+
+async function doLogin() {
+  const password = document.getElementById('login-password').value.trim();
+  if (!password) return;
+
+  const btn = document.getElementById('login-btn');
+  const errDiv = document.getElementById('login-error');
+  const errMsg = document.getElementById('login-error-msg');
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>ログイン中...';
+  errDiv.classList.add('hidden');
+
+  try {
+    const res = await axios.post('/api/login', { password });
+    setToken(res.data.token);
+    showApp();
+  } catch (e) {
+    const msg = e.response?.data?.error || 'ログインに失敗しました';
+    errMsg.textContent = msg;
+    errDiv.classList.remove('hidden');
+    document.getElementById('login-password').value = '';
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-sign-in-alt mr-2"></i>ログイン';
+  }
+}
+
+function doLogout() {
+  clearToken();
+  showLogin();
+}
+
+function showLogin() {
+  document.getElementById('login-overlay').classList.remove('hidden');
+  document.getElementById('sidebar').classList.add('hidden');
+  document.querySelector('.ml-64').classList.add('hidden');
+  document.getElementById('login-password').value = '';
+  document.getElementById('login-error').classList.add('hidden');
+}
+
+function showApp() {
+  document.getElementById('login-overlay').classList.add('hidden');
+  document.getElementById('sidebar').classList.remove('hidden');
+  document.querySelector('.ml-64').classList.remove('hidden');
+}
+
+// axios のデフォルトヘッダーに認証トークンを付与
+axios.interceptors.request.use(config => {
+  const token = getToken();
+  if (token) config.headers['Authorization'] = 'Bearer ' + token;
+  return config;
+});
+
+// 401レスポンスの場合はログイン画面へ
+axios.interceptors.response.use(
+  res => res,
+  err => {
+    if (err.response?.status === 401) {
+      clearToken();
+      showLogin();
+    }
+    return Promise.reject(err);
+  }
+);
+
+// ========================
 // グローバル状態
 // ========================
 let currentPage = 'dashboard';
 let searchResults = [];
+let showClosedItems = false; // 締切済み案件を表示するか
 
 // ========================
 // ページ遷移
@@ -1546,17 +1775,26 @@ function renderResults(areaId, data, label) {
     return;
   }
 
+  // 締切済みフィルタリング
+  const activeItems = showClosedItems ? items : items.filter(item => !isItemClosed(item));
+  const closedCount = items.length - activeItems.length;
+
   let html = \`
     <div class="bg-white rounded-2xl shadow-sm border border-gray-100 mb-6">
-      <div class="p-4 border-b border-gray-100 flex items-center justify-between">
+      <div class="p-4 border-b border-gray-100 flex items-center justify-between flex-wrap gap-2">
         <h3 class="font-bold text-gray-800 text-sm flex items-center gap-2">
           <i class="fas fa-list text-blue-500"></i>
           \${label}
           <span class="ml-2 text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full font-normal">
-            全 \${total.toLocaleString()} 件中 \${items.length} 件表示
+            \${activeItems.length} 件表示
+            \${closedCount > 0 ? \`<span class="text-gray-400 ml-1">（締切済み \${closedCount} 件非表示）</span>\` : ''}
           </span>
         </h3>
-        <div class="flex gap-2">
+        <div class="flex gap-2 flex-wrap">
+          \${closedCount > 0 ? \`
+          <button onclick="toggleClosedItems('" + areaId + "')" class="text-xs px-3 py-1.5 border rounded-lg \${showClosedItems ? 'bg-gray-200 text-gray-700 border-gray-300' : 'text-gray-500 hover:text-blue-600 border-gray-200 hover:border-blue-300'}">
+            <i class="fas fa-eye\${showClosedItems ? '-slash' : ''} mr-1"></i>\${showClosedItems ? '締切済みを隠す' : '締切済みも表示'}
+          </button>\` : ''}
           <button onclick="sortResults('date')" class="text-xs text-gray-500 hover:text-blue-600 px-3 py-1.5 border border-gray-200 rounded-lg hover:border-blue-300">
             <i class="fas fa-sort-amount-down mr-1"></i>公告日順
           </button>
@@ -1568,41 +1806,62 @@ function renderResults(areaId, data, label) {
       <div id="result-list" class="divide-y divide-gray-50">
   \`;
 
-  items.forEach(item => {
+  activeItems.forEach(item => {
     html += renderListItem(item);
   });
+
+  if (activeItems.length === 0 && closedCount > 0) {
+    html += \`<div class="text-center py-12">
+      <i class="fas fa-check-circle text-gray-300 text-4xl mb-4"></i>
+      <p class="text-gray-500">募集中の案件はありません</p>
+      <p class="text-xs text-gray-400 mt-2">締切済み \${closedCount} 件が非表示です</p>
+      <button onclick="toggleClosedItems('\${areaId}')" class="mt-3 text-xs text-blue-600 hover:underline">締切済みも表示する</button>
+    </div>\`;
+  }
 
   html += \`</div></div>\`;
   area.innerHTML = html;
   searchResults = items;
 }
 
+function toggleClosedItems(areaId) {
+  showClosedItems = !showClosedItems;
+  // 現在の表示中のページを再レンダリング
+  const area = document.getElementById(areaId);
+  if (!area || !searchResults.length) return;
+  // renderResults を再呼び出し
+  renderResults(areaId, { items: searchResults, totalHits: searchResults.length }, '検索結果');
+}
+
 function renderListItem(item) {
   const catBadge = getCategoryBadge(item.category);
   const procBadge = item.procedureType ? \`<span class="tag bg-gray-100 text-gray-600">\${item.procedureType}</span>\` : '';
   const issueDate = formatDisplayDate(item.cftIssueDate);
-  const deadline = formatDisplayDate(item.tenderSubmissionDeadline);
+  const deadlineField = getDeadlineField(item);
+  const deadline = formatDisplayDate(deadlineField);
   const openDate = formatDisplayDate(item.openingTendersEvent);
-  const deadlineWarning = isDeadlineSoon(item.tenderSubmissionDeadline);
+  const { status } = getDeadlineStatus(item);
+  const deadlineBadge = renderDeadlineBadge(item);
+  const isClosed = status === 'closed';
 
   return \`
-    <div class="result-row px-6 py-4 cursor-pointer" onclick='showModal(\${JSON.stringify(item).replace(/'/g, "\\\\'")})'>\`
+    <div class="result-row px-6 py-4 cursor-pointer\${isClosed ? ' opacity-50' : ''}" onclick='showModal(\${JSON.stringify(item).replace(/'/g, "\\\\'")})'>\`
     + \`
       <div class="flex items-start justify-between gap-4">
         <div class="flex-1 min-w-0">
           <div class="flex flex-wrap items-center gap-2 mb-2">
             \${catBadge}
             \${procBadge}
-            \${deadlineWarning ? '<span class="tag bg-red-100 text-red-600"><i class="fas fa-fire-alt mr-1"></i>締切間近</span>' : ''}
+            \${deadlineBadge}
           </div>
-          <h4 class="text-sm font-semibold text-gray-800 leading-snug mb-2 line-clamp-2 hover:text-blue-600">
+          <h4 class="text-sm font-semibold \${isClosed ? 'text-gray-400 line-through' : 'text-gray-800'} leading-snug mb-2 line-clamp-2 hover:text-blue-600">
             \${escHtml(item.projectName || '（案件名なし）')}
           </h4>
           <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500">
             \${item.organizationName ? \`<span><i class="fas fa-building mr-1 text-gray-400"></i>\${escHtml(item.organizationName)}</span>\` : ''}
             \${item.prefectureName ? \`<span><i class="fas fa-map-marker-alt mr-1 text-gray-400"></i>\${escHtml(item.prefectureName)}\${item.cityName ? ' ' + escHtml(item.cityName) : ''}</span>\` : ''}
             \${issueDate ? \`<span><i class="fas fa-calendar mr-1 text-gray-400"></i>公告: \${issueDate}</span>\` : ''}
-            \${deadline ? \`<span class="\${deadlineWarning ? 'text-red-500 font-medium' : ''}"><i class="fas fa-clock mr-1 text-gray-400"></i>締切: \${deadline}</span>\` : ''}
+            \${deadline ? \`<span class="\${status === 'urgent' ? 'text-red-500 font-medium' : status === 'warn' ? 'text-yellow-600 font-medium' : ''}"><i class="fas fa-clock mr-1 text-gray-400"></i>締切: \${deadline}</span>\` : ''}
             \${openDate ? \`<span><i class="fas fa-gavel mr-1 text-gray-400"></i>開札: \${openDate}</span>\` : ''}
           </div>
         </div>
@@ -2253,6 +2512,54 @@ function isDeadlineSoon(deadline) {
   return diff >= 0 && diff <= 7;
 }
 
+// ========================
+// 募集期間ステータス
+// ========================
+function getDeadlineField(item) {
+  // 締切日として使うフィールド（優先順位順）
+  return item.tenderSubmissionDeadline || item.tenderDeadline || '';
+}
+
+function getDeadlineStatus(item) {
+  // status: 'open' | 'warn' | 'urgent' | 'closed' | 'unknown'
+  const deadlineStr = getDeadlineField(item);
+  if (!deadlineStr) return { status: 'unknown', diffDays: null };
+  const d = new Date(deadlineStr);
+  if (isNaN(d.getTime())) return { status: 'unknown', diffDays: null };
+  const now = new Date();
+  const diffMs = d - now;
+  const diffDays = diffMs / (1000 * 60 * 60 * 24);
+  if (diffDays < 0) return { status: 'closed', diffDays };
+  if (diffDays < 3) return { status: 'urgent', diffDays };
+  if (diffDays < 7) return { status: 'warn', diffDays };
+  return { status: 'open', diffDays };
+}
+
+function renderDeadlineBadge(item) {
+  const { status, diffDays } = getDeadlineStatus(item);
+  if (status === 'unknown') {
+    return '<span class="tag bg-gray-100 text-gray-400"><i class="fas fa-question-circle mr-1"></i>期限情報なし</span>';
+  }
+  if (status === 'closed') {
+    return '<span class="tag bg-gray-200 text-gray-500"><i class="fas fa-lock mr-1"></i>締切済み</span>';
+  }
+  if (status === 'urgent') {
+    const hrs = Math.floor(diffDays * 24);
+    const label = hrs < 24 ? '残り' + hrs + '時間' : '残り' + Math.ceil(diffDays) + '日';
+    return \`<span class="tag bg-red-100 text-red-600"><i class="fas fa-fire-alt mr-1"></i>\${label}</span>\`;
+  }
+  if (status === 'warn') {
+    return \`<span class="tag bg-yellow-100 text-yellow-700"><i class="fas fa-exclamation-triangle mr-1"></i>残り\${Math.ceil(diffDays)}日</span>\`;
+  }
+  // open
+  return '<span class="tag bg-green-100 text-green-700"><i class="fas fa-check-circle mr-1"></i>募集中</span>';
+}
+
+function isItemClosed(item) {
+  const { status } = getDeadlineStatus(item);
+  return status === 'closed';
+}
+
 function escHtml(str) {
   if (!str) return '';
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -2362,9 +2669,14 @@ async function runNotifyCheck() {
 }
 
 // ========================
-// 初期表示
+// 初期表示（認証チェック）
 // ========================
-loadDashboard();
+if (isLoggedIn()) {
+  showApp();
+  loadDashboard();
+} else {
+  showLogin();
+}
 </script>
 </body>
 </html>`
