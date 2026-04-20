@@ -113,6 +113,175 @@ app.post('/api/login', async (c) => {
 })
 
 // =============================
+// JEED（独立行政法人高齢・障害・求職者雇用支援機構）スクレイピングAPI
+// =============================
+
+function scrapeJeed(html: string): any[] {
+  const items: any[] = []
+  // ul.nyusatsuの中のliを抽出
+  const ulRegex = /<ul class="nyusatsu">([\s\S]*?)<\/ul>/gi
+  let ulMatch
+  while ((ulMatch = ulRegex.exec(html)) !== null) {
+    const ulHtml = ulMatch[1]
+    const liRegex = /<li[^>]*>([\s\S]*?)<\/li>/gi
+    let liMatch
+    while ((liMatch = liRegex.exec(ulHtml)) !== null) {
+      const liHtml = liMatch[1]
+
+      // 日付 (.date)
+      const dateMatch = liHtml.match(/<div class="date"[^>]*>([\s\S]*?)<\/div>/i)
+      const dateRaw = dateMatch ? dateMatch[1].replace(/<[^>]+>/g, '').trim() : ''
+      const cftIssueDate = wareki2iso(dateRaw)
+
+      // 案件名 (.title a)
+      const titleMatch = liHtml.match(/<div class="title"[^>]*>[\s\S]*?<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i)
+      if (!titleMatch) continue
+      let pdfUrl = titleMatch[1]
+      // 相対URLを絶対URLに変換
+      if (pdfUrl.startsWith('/')) pdfUrl = 'https://www.jeed.go.jp' + pdfUrl
+      const projectName = titleMatch[2].replace(/<[^>]+>/g, '').trim()
+        .replace(/（PDF[^）]*）/g, '').trim()
+      if (!projectName) continue
+
+      // 締切日（.bikou 内の「終了：」）
+      const bikouMatch = liHtml.match(/終了：([^<\n]+)/)
+      const deadlineRaw = bikouMatch ? bikouMatch[1].trim() : ''
+      const tenderDeadline = wareki2iso(deadlineRaw)
+
+      // 添付ファイル（.shiryou内のリンク）
+      const attachments: any[] = []
+      const attachRegex = /<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi
+      let attachMatch
+      const shiryouMatch = liHtml.match(/<div class="shiryou">([\s\S]*?)<\/div>/i)
+      if (shiryouMatch) {
+        while ((attachMatch = attachRegex.exec(shiryouMatch[1])) !== null) {
+          let aUrl = attachMatch[1]
+          if (aUrl.startsWith('/')) aUrl = 'https://www.jeed.go.jp' + aUrl
+          const aName = attachMatch[2].replace(/<[^>]+>/g, '').trim()
+          if (aName) attachments.push({ name: aName, url: aUrl })
+        }
+      }
+
+      const resultId = `jeed-${cftIssueDate}-${projectName.slice(0, 20)}`
+      items.push({
+        resultId,
+        source: 'jeed',
+        organizationName: '独立行政法人高齢・障害・求職者雇用支援機構',
+        projectName,
+        procedureType: '一般競争入札',
+        cftIssueDate,
+        tenderDeadline,
+        url: pdfUrl,
+        prefectureName: '東京都',
+        category: '役務',
+        attachments,
+      })
+    }
+  }
+  return items
+}
+
+app.get('/api/jeed', async (c) => {
+  const keyword = c.req.query('keyword') || c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  try {
+    const res = await fetch('https://www.jeed.go.jp/jeed/information/honbu/chotatsu_buppin.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    if (!res.ok) return c.json({ error: `取得失敗: ${res.status}` }, 500)
+    const html = await res.text()
+    let items = scrapeJeed(html)
+    if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
+    return c.json({ source: '独立行政法人高齢・障害・求職者雇用支援機構', totalHits: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+// =============================
+// JFC（株式会社日本政策金融公庫）スクレイピングAPI
+// =============================
+
+function scrapeJfc(html: string): any[] {
+  const items: any[] = []
+  // p-page-supply-bid-1-bid-item クラスのli要素を抽出
+  const liRegex = /<li class="p-page-supply-bid-1-bid-item[^"]*"[^>]*>([\s\S]*?)<\/li>/gi
+  let liMatch
+  while ((liMatch = liRegex.exec(html)) !== null) {
+    const liHtml = liMatch[1]
+
+    // 各dlのdt/ddペアを抽出
+    const dlData: Record<string, string> = {}
+    const dlRegex = /<dl[^>]*>([\s\S]*?)<\/dl>/gi
+    let dlMatch
+    while ((dlMatch = dlRegex.exec(liHtml)) !== null) {
+      const dtMatch = dlMatch[1].match(/<dt>([\s\S]*?)<\/dt>/i)
+      const ddMatch = dlMatch[1].match(/<dd[^>]*>([\s\S]*?)<\/dd>/i)
+      if (dtMatch && ddMatch) {
+        const key = dtMatch[1].replace(/<[^>]+>/g, '').trim()
+        const val = ddMatch[1].replace(/<[^>]+>/g, '').trim()
+        dlData[key] = val
+      }
+    }
+
+    // 案件名と添付PDFのURL
+    const linkMatch = liHtml.match(/<dd class="link"[^>]*>[\s\S]*?<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i)
+    if (!linkMatch) continue
+    let pdfUrl = linkMatch[1]
+    if (pdfUrl.startsWith('/')) pdfUrl = 'https://www.jfc.go.jp' + pdfUrl
+    const projectName = (dlData['案件名：'] || linkMatch[2].replace(/<[^>]+>/g, '')).trim()
+    if (!projectName) continue
+
+    // 掲載日（YYYY年MM月DD日 → YYYY-MM-DD）
+    const postDateRaw = dlData['掲載日（入札公告日）：'] || ''
+    const postDateMatch = postDateRaw.match(/(\d{4})年(\d{2})月(\d{2})日/)
+    const cftIssueDate = postDateMatch
+      ? `${postDateMatch[1]}-${postDateMatch[2]}-${postDateMatch[3]}`
+      : ''
+
+    // 開札日時
+    const openDateRaw = dlData['開札日時：'] || ''
+    const openDateMatch = openDateRaw.match(/(\d{4})年(\d{2})月(\d{2})日/)
+    const tenderDeadline = openDateMatch
+      ? `${openDateMatch[1]}-${openDateMatch[2]}-${openDateMatch[3]}`
+      : ''
+
+    const resultId = `jfc-${cftIssueDate}-${projectName.slice(0, 20)}`
+    items.push({
+      resultId,
+      source: 'jfc',
+      organizationName: '株式会社日本政策金融公庫',
+      projectName,
+      procedureType: '一般競争入札',
+      cftIssueDate,
+      tenderDeadline,
+      url: pdfUrl,
+      prefectureName: '東京都',
+      category: '役務',
+      attachments: [{ name: '入札公告PDF', url: pdfUrl }],
+    })
+  }
+  return items
+}
+
+app.get('/api/jfc', async (c) => {
+  const keyword = c.req.query('keyword') || c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  try {
+    const res = await fetch('https://www.jfc.go.jp/n/supply/bid_1.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    if (!res.ok) return c.json({ error: `取得失敗: ${res.status}` }, 500)
+    const html = await res.text()
+    let items = scrapeJfc(html)
+    if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
+    return c.json({ source: '株式会社日本政策金融公庫', totalHits: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+// =============================
 // 企業年金連合会 スクレイピングAPI
 // =============================
 
@@ -237,7 +406,7 @@ function convertJapaneseDate(dateStr: string): string {
 
 app.get('/api/search-all', async (c) => {
   const keyword = c.req.query('keyword') || ''
-  const sources = (c.req.query('sources') || 'kkj,kyoukaikenpo,pfa').split(',')
+  const sources = (c.req.query('sources') || 'kkj,kyoukaikenpo,pfa,jeed,jfc').split(',')
   const searchFields = (c.req.query('searchFields') || 'name').split(',')
 
   const results: any[] = []
@@ -283,6 +452,32 @@ app.get('/api/search-all', async (c) => {
         const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
         results.push(...filtered)
       } catch(e) { errors['pfa'] = String(e) }
+    })() : Promise.resolve(),
+
+    // JEED（高齢・障害・求職者雇用支援機構）
+    sources.includes('jeed') ? (async () => {
+      try {
+        const res = await fetch('https://www.jeed.go.jp/jeed/information/honbu/chotatsu_buppin.html', {
+          headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+        })
+        const html = await res.text()
+        const items = scrapeJeed(html)
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        results.push(...filtered)
+      } catch(e) { errors['jeed'] = String(e) }
+    })() : Promise.resolve(),
+
+    // JFC（日本政策金融公庫）
+    sources.includes('jfc') ? (async () => {
+      try {
+        const res = await fetch('https://www.jfc.go.jp/n/supply/bid_1.html', {
+          headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+        })
+        const html = await res.text()
+        const items = scrapeJfc(html)
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        results.push(...filtered)
+      } catch(e) { errors['jfc'] = String(e) }
     })() : Promise.resolve(),
   ])
 
@@ -508,15 +703,17 @@ function parseKyoukaikenpoHtml(html: string, sourceLabel: string): any[] {
 
 // 和暦→ISO8601 変換
 function wareki2iso(wareki: string): string {
-  // 例: 令和08年03月23日 → 2026-03-23
-  const m = wareki.match(/令和(\d{1,2})年(\d{1,2})月(\d{1,2})日/)
+  // スペースや改行を正規化
+  const s = wareki.replace(/\s+/g, '')
+  // 例: 令和08年03月23日 or 令和8年4月20日 → 2026-03-23
+  const m = s.match(/令和(\d{1,2})年(\d{1,2})月(\d{1,2})日/)
   if (m) {
     const year = 2018 + parseInt(m[1])
     const month = m[2].padStart(2, '0')
     const day = m[3].padStart(2, '0')
     return `${year}-${month}-${day}T00:00:00+09:00`
   }
-  const m2 = wareki.match(/平成(\d{1,2})年(\d{1,2})月(\d{1,2})日/)
+  const m2 = s.match(/平成(\d{1,2})年(\d{1,2})月(\d{1,2})日/)
   if (m2) {
     const year = 1988 + parseInt(m2[1])
     const month = m2[2].padStart(2, '0')
@@ -956,6 +1153,12 @@ function renderHTML(): string {
     <a href="#" onclick="showPage('pfa')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-pfa">
       <i class="fas fa-piggy-bank w-4"></i> 企業年金連合会
     </a>
+    <a href="#" onclick="showPage('jeed')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-jeed">
+      <i class="fas fa-hands-helping w-4"></i> 高齢・障害・求職者支援機構
+    </a>
+    <a href="#" onclick="showPage('jfc')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-jfc">
+      <i class="fas fa-university w-4"></i> 日本政策金融公庫
+    </a>
     <div class="border-t border-white/20 my-2"></div>
     <p class="text-xs text-blue-300 px-4 py-1 font-medium uppercase tracking-wider">防衛省系</p>
     <a href="#" onclick="showPage('mod')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-mod">
@@ -1311,6 +1514,80 @@ function renderHTML(): string {
         </div>
       </div>
       <div id="pfa-result-area"></div>
+    </div>
+
+    <!-- JEED（高齢・障害・求職者雇用支援機構）ページ -->
+    <div id="page-jeed" class="page-content hidden">
+      <div class="bg-gradient-to-br from-teal-50 to-green-50 border border-teal-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-teal-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-hands-helping text-teal-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">独立行政法人高齢・障害・求職者雇用支援機構 調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">JEEDの入札公告（物品製造・販売・役務提供等）を直接取得します。</p>
+            <div class="flex flex-wrap gap-2">
+              <a href="https://www.jeed.go.jp/jeed/information/honbu/chotatsu_buppin.html" target="_blank"
+                 class="text-xs bg-white border border-teal-200 text-teal-600 px-3 py-1.5 rounded-lg hover:bg-teal-50 flex items-center gap-1">
+                <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="jeed-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-teal-300"
+              onkeypress="if(event.key==='Enter') loadJeed()">
+          </div>
+          <button onclick="loadJeed()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #0d9488, #0f766e);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="jeed-result-area"></div>
+    </div>
+
+    <!-- JFC（日本政策金融公庫）ページ -->
+    <div id="page-jfc" class="page-content hidden">
+      <div class="bg-gradient-to-br from-indigo-50 to-blue-50 border border-indigo-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-indigo-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-university text-indigo-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">株式会社日本政策金融公庫 調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">日本政策金融公庫の入札情報（物品役務等）を直接取得します。</p>
+            <div class="flex flex-wrap gap-2">
+              <a href="https://www.jfc.go.jp/n/supply/bid_1.html" target="_blank"
+                 class="text-xs bg-white border border-indigo-200 text-indigo-600 px-3 py-1.5 rounded-lg hover:bg-indigo-50 flex items-center gap-1">
+                <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="jfc-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              onkeypress="if(event.key==='Enter') loadJfc()">
+          </div>
+          <button onclick="loadJfc()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #4f46e5, #4338ca);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="jfc-result-area"></div>
     </div>
 
     <!-- 防衛省（内局）ページ -->
@@ -1679,6 +1956,8 @@ function showPage(page) {
     service: '役務案件',
     kyoukaikenpo: '協会けんぽ 調達情報',
     pfa: '企業年金連合会 調達情報',
+    jeed: '高齢・障害・求職者雇用支援機構 調達情報',
+    jfc: '日本政策金融公庫 調達情報',
     all: '全ソース一括検索',
     bookmark: 'ブックマーク',
     notify: 'メール通知設定',
@@ -1694,6 +1973,8 @@ function showPage(page) {
     service: '官公需情報ポータルサイト (kkj.go.jp) のリアルタイムデータ',
     kyoukaikenpo: '全国健康保険協会 公式サイトから直接取得',
     pfa: '企業年金連合会 公式サイトから直接取得',
+    jeed: '独立行政法人高齢・障害・求職者雇用支援機構 公式サイトから直接取得',
+    jfc: '株式会社日本政策金融公庫 公式サイトから直接取得',
     all: '官公需ポータル・協会けんぽ・企業年金連合会 3ソースを横断検索',
     bookmark: 'ブラウザのlocalStorageに保存（このPCのみ）',
     notify: 'キーワード一致の新着案件をメールで自動通知',
@@ -1719,6 +2000,10 @@ function showPage(page) {
     loadKyoukaikenpo();
   } else if (page === 'pfa') {
     loadPfa();
+  } else if (page === 'jeed') {
+    loadJeed();
+  } else if (page === 'jfc') {
+    loadJfc();
   } else if (page === 'mod') {
     loadMod();
   } else if (page === 'mod-dih') {
@@ -2330,6 +2615,166 @@ async function loadPfa() {
       <div class="mt-4 text-center text-xs text-gray-400">
         <i class="fas fa-info-circle mr-1"></i>
         データ出典: <a href="https://www.pfa.or.jp/chotatsu/ichiran/index.html" target="_blank" class="text-blue-400 hover:underline">企業年金連合会 調達情報一覧</a>
+      </div>
+    \`;
+
+    area.innerHTML = html;
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+      <i class="fas fa-exclamation-triangle text-yellow-500 text-3xl mb-3"></i>
+      <p class="text-gray-600">取得に失敗しました</p>
+      <p class="text-xs text-gray-400 mt-1">\${e.message}</p>
+    </div>\`;
+  }
+}
+
+// ========================
+// JEED（高齢・障害・求職者雇用支援機構）
+// ========================
+async function loadJeed() {
+  const area = document.getElementById('jeed-result-area');
+  const query = document.getElementById('jeed-query').value.trim();
+
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">高齢・障害・求職者雇用支援機構から調達情報を取得中...</p></div></div>\`;
+
+  try {
+    const params = {};
+    if (query) params.keyword = query;
+    const res = await axios.get('/api/jeed', { params });
+    const data = res.data;
+
+    if (!data.items || data.items.length === 0) {
+      area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+        <i class="fas fa-search text-gray-300 text-5xl mb-4"></i>
+        <p class="text-gray-500 text-lg font-medium">案件が見つかりませんでした</p>
+        <p class="text-gray-400 text-sm mt-2">キーワードを変更して再度お試しください</p>
+      </div>\`;
+      return;
+    }
+
+    let html = \`<div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+      <div class="px-6 py-4 border-b border-gray-50 flex items-center justify-between">
+        <span class="text-sm font-medium text-gray-700">
+          <i class="fas fa-list text-teal-500 mr-2"></i>
+          \${data.totalHits}件の案件
+        </span>
+      </div>
+      <div class="divide-y divide-gray-50">
+    \`;
+
+    data.items.forEach(item => {
+      const issueDate = formatDisplayDate(item.cftIssueDate);
+      const deadlineStatus = item.tenderDeadline ? getDeadlineStatus(item.tenderDeadline) : null;
+      html += \`
+        <div class="px-5 py-4 hover:bg-teal-50 transition-colors cursor-pointer" onclick='showModal(\${JSON.stringify(item).replace(/'/g, "\\\\'")})'>\`
+        + \`
+          <div class="flex items-start justify-between gap-4">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 mb-1">
+                \${issueDate ? \`<span class="text-xs text-gray-400"><i class="fas fa-calendar mr-1"></i>\${issueDate}</span>\` : ''}
+                <span class="tag bg-teal-50 text-teal-700 border border-teal-200 text-xs">入札公告</span>
+                \${deadlineStatus ? \`<span class="\${deadlineStatus.cls} text-xs px-2 py-0.5 rounded-full">\${deadlineStatus.label}</span>\` : ''}
+              </div>
+              <p class="text-sm font-medium text-gray-800 leading-snug hover:text-teal-700">\${escHtml(item.projectName)}</p>
+            </div>
+            <div class="flex items-center gap-2 flex-shrink-0">
+              \${(item.url && item.url.endsWith('.pdf')) ? \`
+                <a href="\${escHtml(item.url)}" target="_blank" onclick="event.stopPropagation()"
+                   class="text-xs bg-red-50 text-red-600 border border-red-200 px-2.5 py-1 rounded-lg hover:bg-red-100 flex items-center gap-1">
+                  <i class="fas fa-file-pdf"></i> PDF
+                </a>
+              \` : ''}
+              <i class="fas fa-chevron-right text-gray-300 text-xs"></i>
+            </div>
+          </div>
+        </div>
+      \`;
+    });
+
+    html += \`</div></div>
+      <div class="mt-4 text-center text-xs text-gray-400">
+        <i class="fas fa-info-circle mr-1"></i>
+        データ出典: <a href="https://www.jeed.go.jp/jeed/information/honbu/chotatsu_buppin.html" target="_blank" class="text-blue-400 hover:underline">JEED 入札公告</a>
+      </div>
+    \`;
+
+    area.innerHTML = html;
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+      <i class="fas fa-exclamation-triangle text-yellow-500 text-3xl mb-3"></i>
+      <p class="text-gray-600">取得に失敗しました</p>
+      <p class="text-xs text-gray-400 mt-1">\${e.message}</p>
+    </div>\`;
+  }
+}
+
+// ========================
+// JFC（日本政策金融公庫）
+// ========================
+async function loadJfc() {
+  const area = document.getElementById('jfc-result-area');
+  const query = document.getElementById('jfc-query').value.trim();
+
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">日本政策金融公庫から調達情報を取得中...</p></div></div>\`;
+
+  try {
+    const params = {};
+    if (query) params.keyword = query;
+    const res = await axios.get('/api/jfc', { params });
+    const data = res.data;
+
+    if (!data.items || data.items.length === 0) {
+      area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+        <i class="fas fa-search text-gray-300 text-5xl mb-4"></i>
+        <p class="text-gray-500 text-lg font-medium">案件が見つかりませんでした</p>
+        <p class="text-gray-400 text-sm mt-2">キーワードを変更して再度お試しください</p>
+      </div>\`;
+      return;
+    }
+
+    let html = \`<div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+      <div class="px-6 py-4 border-b border-gray-50 flex items-center justify-between">
+        <span class="text-sm font-medium text-gray-700">
+          <i class="fas fa-list text-indigo-500 mr-2"></i>
+          \${data.totalHits}件の案件
+        </span>
+      </div>
+      <div class="divide-y divide-gray-50">
+    \`;
+
+    data.items.forEach(item => {
+      const issueDate = formatDisplayDate(item.cftIssueDate);
+      const deadlineStatus = item.tenderDeadline ? getDeadlineStatus(item.tenderDeadline) : null;
+      html += \`
+        <div class="px-5 py-4 hover:bg-indigo-50 transition-colors cursor-pointer" onclick='showModal(\${JSON.stringify(item).replace(/'/g, "\\\\'")})'>\`
+        + \`
+          <div class="flex items-start justify-between gap-4">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 mb-1">
+                \${issueDate ? \`<span class="text-xs text-gray-400"><i class="fas fa-calendar mr-1"></i>\${issueDate}</span>\` : ''}
+                <span class="tag bg-indigo-50 text-indigo-700 border border-indigo-200 text-xs">入札公告</span>
+                \${deadlineStatus ? \`<span class="\${deadlineStatus.cls} text-xs px-2 py-0.5 rounded-full">\${deadlineStatus.label}</span>\` : ''}
+              </div>
+              <p class="text-sm font-medium text-gray-800 leading-snug hover:text-indigo-700">\${escHtml(item.projectName)}</p>
+            </div>
+            <div class="flex items-center gap-2 flex-shrink-0">
+              \${(item.url && item.url.endsWith('.pdf')) ? \`
+                <a href="\${escHtml(item.url)}" target="_blank" onclick="event.stopPropagation()"
+                   class="text-xs bg-red-50 text-red-600 border border-red-200 px-2.5 py-1 rounded-lg hover:bg-red-100 flex items-center gap-1">
+                  <i class="fas fa-file-pdf"></i> PDF
+                </a>
+              \` : ''}
+              <i class="fas fa-chevron-right text-gray-300 text-xs"></i>
+            </div>
+          </div>
+        </div>
+      \`;
+    });
+
+    html += \`</div></div>
+      <div class="mt-4 text-center text-xs text-gray-400">
+        <i class="fas fa-info-circle mr-1"></i>
+        データ出典: <a href="https://www.jfc.go.jp/n/supply/bid_1.html" target="_blank" class="text-blue-400 hover:underline">日本政策金融公庫 入札情報</a>
       </div>
     \`;
 
@@ -3107,6 +3552,32 @@ async function runNotifyCheck(env: {
     totalChecked += items.length
   } catch (e) {
     errors.push(`企業年金連合会: ${String(e)}`)
+  }
+
+  // JEED（高齢・障害・求職者雇用支援機構）
+  try {
+    const res = await fetch('https://www.jeed.go.jp/jeed/information/honbu/chotatsu_buppin.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    const html = await res.text()
+    const items = scrapeJeed(html)
+    items.forEach((item: any) => allItems.push(item))
+    totalChecked += items.length
+  } catch (e) {
+    errors.push(`JEED: ${String(e)}`)
+  }
+
+  // JFC（日本政策金融公庫）
+  try {
+    const res = await fetch('https://www.jfc.go.jp/n/supply/bid_1.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    const html = await res.text()
+    const items = scrapeJfc(html)
+    items.forEach((item: any) => allItems.push(item))
+    totalChecked += items.length
+  } catch (e) {
+    errors.push(`JFC: ${String(e)}`)
   }
 
   // キーワードフィルタリング & 新着判定（案件名＋説明文＋機関名）
