@@ -113,6 +113,338 @@ app.post('/api/login', async (c) => {
 })
 
 // =============================
+// UITEC（職業能力開発総合大学校）スクレイピングAPI
+// =============================
+
+function scrapeUitec(html: string): any[] {
+  const items: any[] = []
+  // menu_listのulからリンクを抽出（例: <li><a href="xxx.pdf">令和X年X月X日　案件名</a></li>）
+  const liRegex = /<li[^>]*>\s*<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>\s*<\/li>/gi
+  let m
+  while ((m = liRegex.exec(html)) !== null) {
+    let href = m[1]
+    const text = m[2].replace(/<[^>]+>/g, '').trim()
+    if (!href.endsWith('.pdf') && !href.endsWith('.PDF')) continue
+    // テキストから日付と案件名を分離（例: "令和８年３月３０日　案件名"）
+    const dateMatch = text.match(/^(令和\s*\d{1,2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)\s*[　\s]+(.+)$/)
+    let dateStr = '', projectName = text
+    if (dateMatch) {
+      dateStr = dateMatch[1]
+      projectName = dateMatch[2].trim()
+    }
+    if (!projectName) continue
+    if (href.startsWith('/')) href = 'https://www.uitec.jeed.go.jp' + href
+    else if (!href.startsWith('http')) href = 'https://www.uitec.jeed.go.jp/topics/tender/' + href
+    const cftIssueDate = wareki2iso(dateStr)
+    const resultId = `uitec-${cftIssueDate}-${projectName.slice(0, 20)}`
+    items.push({
+      resultId,
+      source: 'uitec',
+      organizationName: '職業能力開発総合大学校',
+      projectName,
+      procedureType: '入札公告',
+      cftIssueDate,
+      url: href,
+      prefectureName: '東京都',
+      category: '役務',
+      attachments: [{ name: '公告PDF', url: href }],
+    })
+  }
+  return items
+}
+
+app.get('/api/uitec', async (c) => {
+  const keyword = c.req.query('keyword') || c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  // 2つの個票ページを取得してマージ
+  const pages = [
+    'https://www.uitec.jeed.go.jp/topics/tender/fp2ce800000000p3.html',
+    'https://www.uitec.jeed.go.jp/topics/tender/ka7cok0000005u3v.html',
+  ]
+  try {
+    const allItems: any[] = []
+    for (const url of pages) {
+      try {
+        const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' } })
+        if (res.ok) {
+          const html = await res.text()
+          allItems.push(...scrapeUitec(html))
+        }
+      } catch (_) {}
+    }
+    // 重複除去
+    const seen = new Set<string>()
+    const items = allItems.filter(item => {
+      if (seen.has(item.resultId)) return false
+      seen.add(item.resultId)
+      return true
+    })
+    const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+    return c.json({ source: '職業能力開発総合大学校', totalHits: filtered.length, items: filtered })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+// =============================
+// 大阪市デジタル統括室 スクレイピングAPI
+// =============================
+
+function scrapeOsakaCity(html: string): any[] {
+  const items: any[] = []
+  // <div class="sec_01"><h2><a href="...">案件名</a></h2><table>...</table></div>
+  const secRegex = /<div class="sec_01">([\s\S]*?)<\/div>/gi
+  let m
+  while ((m = secRegex.exec(html)) !== null) {
+    const sec = m[1]
+    const titleMatch = sec.match(/<h2[^>]*>[\s\S]*?<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/)
+    if (!titleMatch) continue
+    let url = titleMatch[1]
+    if (url.startsWith('/')) url = 'https://www.city.osaka.lg.jp' + url
+    const projectName = titleMatch[2].replace(/<[^>]+>/g, '').trim()
+    if (!projectName) continue
+    // tableのth/tdペアを解析
+    const tdData: Record<string, string> = {}
+    const rowReg = /<tr>([\s\S]*?)<\/tr>/gi
+    let row
+    while ((row = rowReg.exec(sec)) !== null) {
+      const th = row[1].match(/<th[^>]*>([\s\S]*?)<\/th>/i)
+      const td = row[1].match(/<td[^>]*>([\s\S]*?)<\/td>/i)
+      if (th && td) {
+        tdData[th[1].replace(/<[^>]+>/g, '').trim()] = td[1].replace(/<[^>]+>/g, '').trim()
+      }
+    }
+    const postDateRaw = tdData['公告（公開）日'] || ''
+    const deadlineRaw = tdData['入札（締切）日時'] || ''
+    const cftIssueDate = wareki2iso(postDateRaw)
+    // 締切日から日付部分だけ抽出して変換
+    const deadlineDateMatch = deadlineRaw.match(/令和\d{1,2}年\d{1,2}月\d{1,2}日/)
+    const tenderDeadline = deadlineDateMatch ? wareki2iso(deadlineDateMatch[0]) : ''
+    const resultId = `osaka-${cftIssueDate}-${projectName.slice(0, 20)}`
+    items.push({
+      resultId,
+      source: 'osaka',
+      organizationName: '大阪市デジタル統括室',
+      projectName,
+      procedureType: tdData['入札契約方式'] || '一般競争入札',
+      cftIssueDate,
+      tenderDeadline,
+      url,
+      prefectureName: '大阪府',
+      category: '役務',
+      attachments: [],
+    })
+  }
+  return items
+}
+
+app.get('/api/osaka', async (c) => {
+  const keyword = c.req.query('keyword') || c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  try {
+    const res = await fetch('https://www.city.osaka.lg.jp/templates/gyomuitaku_nyusatsuanken/98-Curr.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    if (!res.ok) return c.json({ error: `取得失敗: ${res.status}` }, 500)
+    const html = await res.text()
+    let items = scrapeOsakaCity(html)
+    if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
+    return c.json({ source: '大阪市デジタル統括室', totalHits: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+// =============================
+// 北海道情報政策課 スクレイピングAPI
+// =============================
+
+function scrapeHokkaido(html: string): any[] {
+  const items: any[] = []
+  // <article class="item-xxx"><header><time datetime="YYYY-MM-DD">...</time><h2><a href="...">案件名</a></h2></header></article>
+  const articleReg = /<article[^>]*>([\s\S]*?)<\/article>/gi
+  let m
+  while ((m = articleReg.exec(html)) !== null) {
+    const art = m[1]
+    const timeMatch = art.match(/<time[^>]+datetime="([^"]+)"/)
+    const linkMatch = art.match(/<h2[^>]*>[\s\S]*?<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/)
+    if (!timeMatch || !linkMatch) continue
+    const cftIssueDate = timeMatch[1] // YYYY-MM-DD形式
+    let url = linkMatch[1]
+    if (url.startsWith('/')) url = 'https://www.pref.hokkaido.lg.jp' + url
+    const projectName = linkMatch[2].replace(/<[^>]+>/g, '').trim()
+    if (!projectName) continue
+    const resultId = `hokkaido-${cftIssueDate}-${projectName.slice(0, 20)}`
+    items.push({
+      resultId,
+      source: 'hokkaido',
+      organizationName: '北海道 情報政策課',
+      projectName,
+      procedureType: '一般競争入札',
+      cftIssueDate: cftIssueDate + 'T00:00:00+09:00',
+      url,
+      prefectureName: '北海道',
+      category: '役務',
+      attachments: [],
+    })
+  }
+  return items
+}
+
+app.get('/api/hokkaido', async (c) => {
+  const keyword = c.req.query('keyword') || c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  try {
+    const res = await fetch('https://www.pref.hokkaido.lg.jp/sm/jsk/a0001/b0002/', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    if (!res.ok) return c.json({ error: `取得失敗: ${res.status}` }, 500)
+    const html = await res.text()
+    let items = scrapeHokkaido(html)
+    if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
+    return c.json({ source: '北海道 情報政策課', totalHits: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+// =============================
+// 今治市産業振興課 スクレイピングAPI
+// =============================
+
+function scrapeImabari(html: string): any[] {
+  const items: any[] = []
+  // <dl><dt>2026年4月3日</dt><dd><a href="...">案件名</a></dd></dl>
+  const dtReg = /<dt>([\s\S]*?)<\/dt>\s*<dd>([\s\S]*?)<\/dd>/gi
+  let m
+  while ((m = dtReg.exec(html)) !== null) {
+    const dateRaw = m[1].replace(/<[^>]+>/g, '').trim()
+    const dd = m[2]
+    // プロポーザル案件のみ（ddのリンクが/sangyou/proposal/のパスを含む）
+    const linkMatch = dd.match(/<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/)
+    if (!linkMatch) continue
+    if (!linkMatch[1].includes('/sangyou/')) continue
+    const projectName = linkMatch[2].replace(/<[^>]+>/g, '').trim()
+    if (!projectName) continue
+    // 質問回答更新などの更新情報を除外（案件公告のみ残す）
+    if (projectName.includes('質問') || projectName.includes('回答') || projectName.includes('選定結果')) continue
+    // 日付変換（YYYY年M月D日）
+    const dMatch = dateRaw.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/)
+    const cftIssueDate = dMatch ? `${dMatch[1]}-${dMatch[2].padStart(2,'0')}-${dMatch[3].padStart(2,'0')}T00:00:00+09:00` : ''
+    let url = linkMatch[1]
+    if (url.startsWith('/')) url = 'https://www.city.imabari.ehime.jp' + url
+    const resultId = `imabari-${cftIssueDate}-${projectName.slice(0, 20)}`
+    items.push({
+      resultId,
+      source: 'imabari',
+      organizationName: '今治市 産業振興課',
+      projectName,
+      procedureType: '公募型プロポーザル',
+      cftIssueDate,
+      url,
+      prefectureName: '愛媛県',
+      category: '役務',
+      attachments: [],
+    })
+  }
+  return items
+}
+
+app.get('/api/imabari', async (c) => {
+  const keyword = c.req.query('keyword') || c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  try {
+    const res = await fetch('https://www.city.imabari.ehime.jp/sangyou/new.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    if (!res.ok) return c.json({ error: `取得失敗: ${res.status}` }, 500)
+    const html = await res.text()
+    let items = scrapeImabari(html)
+    if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
+    return c.json({ source: '今治市 産業振興課', totalHits: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+// =============================
+// 長野県営業局 スクレイピングAPI
+// =============================
+
+function scrapeNagano(html: string): any[] {
+  const items: any[] = []
+  // <h2>または<h3>で区切られた案件ブロック、その後にtableで詳細
+  // h2タグで案件名を取得
+  const h2Reg = /<h[23][^>]*>([\s\S]*?)<\/h[23]>/gi
+  let m
+  const projectNames: string[] = []
+  while ((m = h2Reg.exec(html)) !== null) {
+    const t = m[1].replace(/<[^>]+>/g, '').trim()
+    if (t && !t.includes('トップ') && !t.includes('更新') && !t.includes('サイト') && !t.includes('お問')) {
+      projectNames.push(t)
+    }
+  }
+  // tableの行から日付を抽出
+  const tables: string[] = []
+  const tableReg = /<table[^>]*>([\s\S]*?)<\/table>/gi
+  while ((m = tableReg.exec(html)) !== null) {
+    tables.push(m[1])
+  }
+  // 案件名とtableを対応付け（順序でマッチング）
+  projectNames.forEach((projectName, i) => {
+    const table = tables[i] || ''
+    // 公告日を探す
+    const dateRow = table.match(/公告日[\s\S]*?<td[^>]*>([\s\S]*?)<\/td>/i)
+    const dateRaw = dateRow ? dateRow[1].replace(/<[^>]+>/g, '').trim() : ''
+    // 全角数字 → 半角
+    const dateNorm = dateRaw.replace(/[０-９]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
+    const dMatch = dateNorm.match(/令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/)
+    let cftIssueDate = ''
+    if (dMatch) {
+      const y = 2018 + parseInt(dMatch[1])
+      const mo = dMatch[2].padStart(2, '0')
+      const d = dMatch[3].padStart(2, '0')
+      cftIssueDate = `${y}-${mo}-${d}T00:00:00+09:00`
+    }
+    // PDFリンクを探す
+    const pdfMatch = table.match(/href="([^"]*\.pdf[^"]*)"/i) || html.match(new RegExp(`href="([^"]*\\.pdf[^"]*)"`, 'i'))
+    let url = pdfMatch ? pdfMatch[1] : 'https://www.pref.nagano.lg.jp/eigyo/0415propo.html'
+    if (url.startsWith('/')) url = 'https://www.pref.nagano.lg.jp' + url
+    const resultId = `nagano-${cftIssueDate}-${projectName.slice(0, 20)}`
+    items.push({
+      resultId,
+      source: 'nagano',
+      organizationName: '長野県 営業局',
+      projectName,
+      procedureType: '公募型プロポーザル',
+      cftIssueDate,
+      url,
+      prefectureName: '長野県',
+      category: '役務',
+      attachments: [],
+    })
+  })
+  return items
+}
+
+app.get('/api/nagano', async (c) => {
+  const keyword = c.req.query('keyword') || c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  try {
+    const res = await fetch('https://www.pref.nagano.lg.jp/eigyo/0415propo.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    if (!res.ok) return c.json({ error: `取得失敗: ${res.status}` }, 500)
+    const html = await res.text()
+    let items = scrapeNagano(html)
+    if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
+    return c.json({ source: '長野県 営業局', totalHits: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+// =============================
 // JEED（独立行政法人高齢・障害・求職者雇用支援機構）スクレイピングAPI
 // =============================
 
@@ -193,6 +525,122 @@ app.get('/api/jeed', async (c) => {
     let items = scrapeJeed(html)
     if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
     return c.json({ source: '独立行政法人高齢・障害・求職者雇用支援機構', totalHits: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+// =============================
+// IPA（独立行政法人情報処理推進機構）スクレイピング
+// =============================
+
+function scrapeIpa(html: string): any[] {
+  const items: any[] = []
+  // <li class="news-list__item"> の中に日付 news-list__date と タイトル news-list__ttl、リンクhrefがある
+  const liRegex = /<li class="news-list__item"[^>]*>([\s\S]*?)<\/li>/gi
+  let liMatch
+  while ((liMatch = liRegex.exec(html)) !== null) {
+    const liHtml = liMatch[1]
+
+    // リンクURL
+    const linkMatch = liHtml.match(/<a[^>]+href="([^"]*)"[^>]*>/)
+    if (!linkMatch) continue
+    let url = linkMatch[1]
+    if (url.startsWith('/')) url = 'https://www.ipa.go.jp' + url
+
+    // 日付 <p class="news-list__date">YYYY年M月D日</p>
+    const dateMatch = liHtml.match(/<p class="news-list__date">([^<]+)<\/p>/i)
+    const dateRaw = dateMatch ? dateMatch[1].trim() : ''
+    const dateIso = dateRaw.replace(/(\d{4})年(\d{1,2})月(\d{1,2})日/, (_, y, m, d) =>
+      `${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`)
+
+    // タイトル <p class="news-list__ttl">...</p>
+    const titleMatch = liHtml.match(/<p class="news-list__ttl">([\s\S]*?)<\/p>/i)
+    const projectName = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim() : ''
+    if (!projectName) continue
+
+    const resultId = `ipa-${dateIso}-${projectName.slice(0, 20)}`
+    items.push({
+      resultId,
+      source: 'ipa',
+      organizationName: '独立行政法人情報処理推進機構（IPA）',
+      projectName,
+      procedureType: '一般競争入札',
+      cftIssueDate: dateIso,
+      url,
+      prefectureName: '東京都',
+      category: '役務',
+      attachments: [],
+    })
+  }
+  return items
+}
+
+app.get('/api/ipa', async (c) => {
+  const keyword = c.req.query('keyword') || c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  try {
+    const res = await fetch('https://www.ipa.go.jp/choutatsu/nyusatsu/2026/index.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    if (!res.ok) return c.json({ error: `取得失敗: ${res.status}` }, 500)
+    const html = await res.text()
+    let items = scrapeIpa(html)
+    if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
+    return c.json({ source: '独立行政法人情報処理推進機構（IPA）', totalHits: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+// =============================
+// 防災科研（国立研究開発法人防災科学技術研究所）スクレイピング
+// =============================
+
+function scrapeBosai(html: string): any[] {
+  const items: any[] = []
+  // <TR><TD>YYYY.MM.DD</TD><TD class="link4"><A href="...">案件名</A></TD></TR>
+  const rowRegex = /<TR[^>]*>\s*<TD[^>]*>(\d{4}\.\d{2}\.\d{2})<\/TD>\s*<TD[^>]*class="link4"[^>]*><A[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/A><\/TD>\s*<\/TR>/gi
+  let match
+  while ((match = rowRegex.exec(html)) !== null) {
+    const dateRaw = match[1] // YYYY.MM.DD
+    const dateIso = dateRaw.replace(/(\d{4})\.(\d{2})\.(\d{2})/, '$1-$2-$3')
+    let url = match[2]
+    if (!url.startsWith('http')) {
+      url = 'https://www.bosai.go.jp/kokai/nyuusatsu/' + url.replace(/^\.?\//, '')
+    }
+    const projectName = match[3].replace(/<[^>]+>/g, '').trim()
+    if (!projectName || projectName.includes('ひながた') || projectName.startsWith('★')) continue
+
+    const resultId = `bosai-${dateIso}-${projectName.slice(0, 20)}`
+    items.push({
+      resultId,
+      source: 'bosai',
+      organizationName: '国立研究開発法人防災科学技術研究所',
+      projectName,
+      procedureType: '一般競争入札',
+      cftIssueDate: dateIso,
+      url,
+      prefectureName: '茨城県',
+      category: '役務',
+      attachments: [{ name: '入札公告PDF', url }],
+    })
+  }
+  return items
+}
+
+app.get('/api/bosai', async (c) => {
+  const keyword = c.req.query('keyword') || c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  try {
+    const res = await fetch('https://www.bosai.go.jp/kokai/nyuusatsu/index.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    if (!res.ok) return c.json({ error: `取得失敗: ${res.status}` }, 500)
+    const html = await res.text()
+    let items = scrapeBosai(html)
+    if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
+    return c.json({ source: '国立研究開発法人防災科学技術研究所', totalHits: items.length, items })
   } catch (e) {
     return c.json({ error: String(e) }, 500)
   }
@@ -478,6 +926,118 @@ app.get('/api/search-all', async (c) => {
         const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
         results.push(...filtered)
       } catch(e) { errors['jfc'] = String(e) }
+    })() : Promise.resolve(),
+
+    // 金融庁
+    sources.includes('fsa') ? (async () => {
+      try {
+        const res = await fetch('https://www.fsa.go.jp/choutatu/choutatu_j/nyusatu_menu.html', {
+          headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+        })
+        const html = await res.text()
+        const items = scrapeFsa(html)
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        results.push(...filtered)
+      } catch(e) { errors['fsa'] = String(e) }
+    })() : Promise.resolve(),
+
+    // UITEC（職業能力開発総合大学校）
+    sources.includes('uitec') ? (async () => {
+      try {
+        const pages = [
+          'https://www.uitec.jeed.go.jp/topics/tender/fp2ce800000000p3.html',
+          'https://www.uitec.jeed.go.jp/topics/tender/ka7cok0000005u3v.html',
+        ]
+        const allUitecItems: any[] = []
+        for (const url of pages) {
+          try {
+            const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' } })
+            if (r.ok) allUitecItems.push(...scrapeUitec(await r.text()))
+          } catch (_) {}
+        }
+        const seen = new Set<string>()
+        const items = allUitecItems.filter(i => { if (seen.has(i.resultId)) return false; seen.add(i.resultId); return true })
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        results.push(...filtered)
+      } catch(e) { errors['uitec'] = String(e) }
+    })() : Promise.resolve(),
+
+    // 大阪市デジタル統括室
+    sources.includes('osaka') ? (async () => {
+      try {
+        const res = await fetch('https://www.city.osaka.lg.jp/templates/gyomuitaku_nyusatsuanken/98-Curr.html', {
+          headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+        })
+        const html = await res.text()
+        const items = scrapeOsakaCity(html)
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        results.push(...filtered)
+      } catch(e) { errors['osaka'] = String(e) }
+    })() : Promise.resolve(),
+
+    // 北海道情報政策課
+    sources.includes('hokkaido') ? (async () => {
+      try {
+        const res = await fetch('https://www.pref.hokkaido.lg.jp/sm/jsk/a0001/b0002/', {
+          headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+        })
+        const html = await res.text()
+        const items = scrapeHokkaido(html)
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        results.push(...filtered)
+      } catch(e) { errors['hokkaido'] = String(e) }
+    })() : Promise.resolve(),
+
+    // 今治市産業振興課
+    sources.includes('imabari') ? (async () => {
+      try {
+        const res = await fetch('https://www.city.imabari.ehime.jp/sangyou/new.html', {
+          headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+        })
+        const html = await res.text()
+        const items = scrapeImabari(html)
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        results.push(...filtered)
+      } catch(e) { errors['imabari'] = String(e) }
+    })() : Promise.resolve(),
+
+    // 長野県営業局
+    sources.includes('nagano') ? (async () => {
+      try {
+        const res = await fetch('https://www.pref.nagano.lg.jp/eigyo/0415propo.html', {
+          headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+        })
+        const html = await res.text()
+        const items = scrapeNagano(html)
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        results.push(...filtered)
+      } catch(e) { errors['nagano'] = String(e) }
+    })() : Promise.resolve(),
+
+    // IPA（情報処理推進機構）
+    sources.includes('ipa') ? (async () => {
+      try {
+        const res = await fetch('https://www.ipa.go.jp/choutatsu/nyusatsu/2026/index.html', {
+          headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+        })
+        const html = await res.text()
+        const items = scrapeIpa(html)
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        results.push(...filtered)
+      } catch(e) { errors['ipa'] = String(e) }
+    })() : Promise.resolve(),
+
+    // 防災科研
+    sources.includes('bosai') ? (async () => {
+      try {
+        const res = await fetch('https://www.bosai.go.jp/kokai/nyuusatsu/index.html', {
+          headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+        })
+        const html = await res.text()
+        const items = scrapeBosai(html)
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        results.push(...filtered)
+      } catch(e) { errors['bosai'] = String(e) }
     })() : Promise.resolve(),
   ])
 
@@ -1032,6 +1592,92 @@ app.get('/api/mod-dih', async (c) => {
 })
 
 // =============================
+// 金融庁 スクレイピングAPI
+// URL: https://www.fsa.go.jp/choutatu/choutatu_j/nyusatu_menu.html
+// 構造: <table><thead><th>公示日</th><th>案件名</th></thead><tbody>
+//       <tr><th scope="row"><a href="xxx.pdf">令和X年X月X日付公告</a></th><td>案件名</td></tr>
+// =============================
+function scrapeFsa(html: string): any[] {
+  const items: any[] = []
+  // 8つのテーブルから全案件を抽出（入札公告・企画競争・公募・随意契約など）
+  const tableRegex = /<table[^>]*>([\s\S]*?)<\/table>/gi
+  let tMatch
+  const sectionTitles: string[] = []
+  // h3タグからセクションタイトルを取得（テーブルと1対1対応）
+  const h3Regex = /<h3[^>]*>([\s\S]*?)<\/h3>/gi
+  let h3M
+  while ((h3M = h3Regex.exec(html)) !== null) {
+    const t = h3M[1].replace(/<[^>]+>/g, '').trim()
+    if (t) sectionTitles.push(t)
+  }
+  let tableIdx = 0
+  while ((tMatch = tableRegex.exec(html)) !== null) {
+    const tableHtml = tMatch[1]
+    const procedureType = sectionTitles[tableIdx] || '入札公告'
+    tableIdx++
+    // 落札者公示・随意契約などはスキップ（入札公告・企画競争・公募のみ）
+    if (procedureType.includes('落札') || procedureType.includes('随意')) continue
+    const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi
+    let rowMatch
+    while ((rowMatch = rowRegex.exec(tableHtml)) !== null) {
+      const row = rowMatch[1]
+      // th[scope=row] から日付テキスト・PDFリンクを取得
+      const thMatch = row.match(/<th[^>]*scope=["']?row["']?[^>]*>([\s\S]*?)<\/th>/i)
+      if (!thMatch) continue
+      const thHtml = thMatch[1]
+      const aMatch = thHtml.match(/<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i)
+      if (!aMatch) continue
+      let pdfPath = aMatch[1]
+      const dateText = aMatch[2].replace(/<[^>]+>/g, '').trim()
+      // 日付テキスト例: "令和８年４月15日付公告" → ISO変換
+      // 全角数字→半角変換してからwareki2iso
+      const dateNorm = dateText.replace(/[０-９]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
+      const cftIssueDate = wareki2iso(dateNorm)
+      // td から案件名
+      const tdMatch = row.match(/<td[^>]*>([\s\S]*?)<\/td>/i)
+      if (!tdMatch) continue
+      const projectName = tdMatch[1].replace(/<[^>]+>/g, '').trim()
+      if (!projectName) continue
+      // PDF URLを絶対URLに変換
+      if (!pdfPath.startsWith('http')) {
+        pdfPath = 'https://www.fsa.go.jp' + (pdfPath.startsWith('/') ? pdfPath : '/choutatu/choutatu_j/' + pdfPath)
+      }
+      const resultId = `fsa-${cftIssueDate}-${projectName.slice(0, 20)}`
+      items.push({
+        resultId,
+        source: 'fsa',
+        organizationName: '金融庁',
+        projectName,
+        procedureType,
+        cftIssueDate,
+        url: pdfPath,
+        prefectureName: '東京都',
+        category: '役務',
+        attachments: [{ name: '公告PDF', url: pdfPath }],
+      })
+    }
+  }
+  return items
+}
+
+app.get('/api/fsa', async (c) => {
+  const keyword = c.req.query('keyword') || c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  try {
+    const res = await fetch('https://www.fsa.go.jp/choutatu/choutatu_j/nyusatu_menu.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    if (!res.ok) return c.json({ error: `取得失敗: ${res.status}` }, 500)
+    const html = await res.text()
+    let items = scrapeFsa(html)
+    if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
+    return c.json({ source: '金融庁', totalHits: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+// =============================
 // フロントエンド HTML配信（APIルートより後に定義）
 // =============================
 // ※ notify-check / notify-status は renderHTML() 関数定義後、
@@ -1123,62 +1769,119 @@ function renderHTML(): string {
       </div>
     </div>
   </div>
-  <nav class="flex-1 p-4 space-y-1">
-    <a href="#" onclick="showPage('dashboard')" class="sidebar-link active flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-dashboard">
+  <nav class="flex-1 p-4 space-y-1 overflow-y-auto" style="scrollbar-width:thin;scrollbar-color:rgba(255,255,255,0.2) transparent;">
+    <a href="#" onclick="showPage('dashboard')" class="sidebar-link active flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-dashboard">
       <i class="fas fa-th-large w-4"></i> ダッシュボード
     </a>
-    <a href="#" onclick="showPage('search')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-search">
+    <a href="#" onclick="showPage('search')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-search">
       <i class="fas fa-search w-4"></i> 案件検索
     </a>
-    <a href="#" onclick="showPage('new')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-new">
+    <a href="#" onclick="showPage('new')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-new">
       <i class="fas fa-clock w-4"></i> 新着案件
     </a>
-    <a href="#" onclick="showPage('construction')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-construction">
+    <a href="#" onclick="showPage('construction')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-construction">
       <i class="fas fa-hard-hat w-4"></i> 工事案件
     </a>
-    <a href="#" onclick="showPage('goods')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-goods">
+    <a href="#" onclick="showPage('goods')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-goods">
       <i class="fas fa-box w-4"></i> 物品案件
     </a>
-    <a href="#" onclick="showPage('service')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-service">
+    <a href="#" onclick="showPage('service')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-service">
       <i class="fas fa-concierge-bell w-4"></i> 役務案件
     </a>
     <div class="border-t border-white/20 my-2"></div>
-    <p class="text-xs text-blue-300 px-4 py-1 font-medium uppercase tracking-wider">特定機関</p>
-    <a href="#" onclick="showPage('all')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-all">
+    <p class="text-xs text-blue-300 px-4 py-1 font-medium uppercase tracking-wider">一括検索</p>
+    <a href="#" onclick="showPage('all')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-all">
       <i class="fas fa-layer-group w-4"></i> 全ソース一括検索
     </a>
-    <a href="#" onclick="showPage('kyoukaikenpo')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-kyoukaikenpo">
+    <div class="border-t border-white/20 my-2"></div>
+    <p class="text-xs text-blue-300 px-4 py-1 font-medium uppercase tracking-wider">独法・研究機関</p>
+    <a href="#" onclick="showPage('jeed')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-jeed">
+      <i class="fas fa-hands-helping w-4"></i> JEED雇用支援機構
+    </a>
+    <a href="#" onclick="showPage('uitec')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-uitec">
+      <i class="fas fa-graduation-cap w-4"></i> 職業能力開発大学校
+    </a>
+    <a href="#" onclick="showPage('ipa')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-ipa">
+      <i class="fas fa-microchip w-4"></i> IPA 情報処理推進機構
+    </a>
+    <a href="#" onclick="showPage('bosai')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-bosai">
+      <i class="fas fa-hard-hat w-4"></i> 防災科学技術研究所
+    </a>
+    <div class="border-t border-white/20 my-2"></div>
+    <p class="text-xs text-blue-300 px-4 py-1 font-medium uppercase tracking-wider">社会保険・金融</p>
+    <a href="#" onclick="showPage('kyoukaikenpo')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kyoukaikenpo">
       <i class="fas fa-heartbeat w-4"></i> 協会けんぽ
     </a>
-    <a href="#" onclick="showPage('pfa')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-pfa">
+    <a href="#" onclick="showPage('pfa')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-pfa">
       <i class="fas fa-piggy-bank w-4"></i> 企業年金連合会
     </a>
-    <a href="#" onclick="showPage('jeed')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-jeed">
-      <i class="fas fa-hands-helping w-4"></i> 高齢・障害・求職者支援機構
-    </a>
-    <a href="#" onclick="showPage('jfc')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-jfc">
+    <a href="#" onclick="showPage('jfc')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-jfc">
       <i class="fas fa-university w-4"></i> 日本政策金融公庫
+    </a>
+    <a href="#" onclick="showPage('fsa')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-fsa">
+      <i class="fas fa-chart-line w-4"></i> 金融庁
     </a>
     <div class="border-t border-white/20 my-2"></div>
     <p class="text-xs text-blue-300 px-4 py-1 font-medium uppercase tracking-wider">防衛省系</p>
-    <a href="#" onclick="showPage('mod')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-mod">
+    <a href="#" onclick="showPage('mod')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-mod">
       <i class="fas fa-shield-alt w-4"></i> 防衛省（内局）
     </a>
-    <a href="#" onclick="showPage('mod-dih')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-mod-dih">
+    <a href="#" onclick="showPage('mod-dih')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-mod-dih">
       <i class="fas fa-satellite-dish w-4"></i> 防衛省情報本部
     </a>
-    <a href="#" onclick="window.open('https://www.mod.go.jp/atla/data/info/ny_honbu/ippan.html','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-mod-atla">
+    <a href="#" onclick="window.open('https://www.mod.go.jp/atla/data/info/ny_honbu/ippan.html','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-mod-atla">
       <i class="fas fa-cogs w-4"></i> 防衛装備庁 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
     </a>
-    <a href="#" onclick="window.open('https://www.mod.go.jp/gsdf/tercom/procurement.html','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-mod-gsdf">
+    <a href="#" onclick="window.open('https://www.mod.go.jp/gsdf/tercom/procurement.html','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-mod-gsdf">
       <i class="fas fa-user-shield w-4"></i> 陸上自衛隊 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
     </a>
     <div class="border-t border-white/20 my-2"></div>
-    <a href="#" onclick="showPage('bookmark')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-bookmark">
+    <p class="text-xs text-blue-300 px-4 py-1 font-medium uppercase tracking-wider">地方自治体</p>
+    <a href="#" onclick="showPage('osaka')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-osaka">
+      <i class="fas fa-city w-4"></i> 大阪市デジタル統括室
+    </a>
+    <a href="#" onclick="showPage('hokkaido')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-hokkaido">
+      <i class="fas fa-snowflake w-4"></i> 北海道 情報政策課
+    </a>
+    <a href="#" onclick="showPage('imabari')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-imabari">
+      <i class="fas fa-map-marker-alt w-4"></i> 今治市 産業振興課
+    </a>
+    <a href="#" onclick="showPage('nagano')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-nagano">
+      <i class="fas fa-mountain w-4"></i> 長野県 営業局
+    </a>
+    <a href="#" onclick="window.open('https://www.city.setagaya.lg.jp/','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-setagaya">
+      <i class="fas fa-building w-4"></i> 世田谷区 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
+    </a>
+    <a href="#" onclick="window.open('https://www.city.kitakyushu.lg.jp/contents/division337list.html','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kitakyushu">
+      <i class="fas fa-industry w-4"></i> 北九州市DX・AI戦略室 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
+    </a>
+    <a href="#" onclick="window.open('https://www.city.ota.tokyo.jp/','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-ota">
+      <i class="fas fa-map w-4"></i> 大田区 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
+    </a>
+    <a href="#" onclick="window.open('https://www.city.itabashi.tokyo.jp/','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-itabashi">
+      <i class="fas fa-landmark w-4"></i> 板橋区 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
+    </a>
+    <a href="#" onclick="window.open('https://www.city.suginami.tokyo.jp/nyuusatsuoshirase/proposal/index.html','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-suginami">
+      <i class="fas fa-file-contract w-4"></i> 杉並区プロポーザル <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
+    </a>
+    <a href="#" onclick="window.open('https://www.city.kumamoto.jp/','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kumamoto">
+      <i class="fas fa-torii-gate w-4"></i> 熊本市 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
+    </a>
+    <a href="#" onclick="window.open('https://www.pref.kagawa.lg.jp/','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kagawa">
+      <i class="fas fa-water w-4"></i> 香川県 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
+    </a>
+    <a href="#" onclick="window.open('https://www.pref.shizuoka.jp/','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-shizuoka">
+      <i class="fas fa-leaf w-4"></i> 静岡県 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
+    </a>
+    <a href="#" onclick="window.open('https://www.nilim.go.jp/lab/adg/koukoku.htm','_blank')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-nilim">
+      <i class="fas fa-road w-4"></i> 国土技術政策総合研究所 <i class="fas fa-external-link-alt ml-auto text-xs opacity-60"></i>
+    </a>
+    <div class="border-t border-white/20 my-2"></div>
+    <a href="#" onclick="showPage('bookmark')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-bookmark">
       <i class="fas fa-star w-4"></i> ブックマーク
       <span id="bookmark-count-badge" class="ml-auto bg-yellow-400 text-yellow-900 text-xs font-bold px-2 py-0.5 rounded-full hidden">0</span>
     </a>
-    <a href="#" onclick="showPage('notify')" class="sidebar-link flex items-center gap-3 px-4 py-3 rounded-lg text-sm" id="nav-notify">
+    <a href="#" onclick="showPage('notify')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-notify">
       <i class="fas fa-bell w-4"></i> メール通知設定
     </a>
   </nav>
@@ -1186,8 +1889,7 @@ function renderHTML(): string {
     <button onclick="doLogout()" class="w-full flex items-center justify-center gap-2 text-xs text-blue-200 hover:text-white hover:bg-white/10 rounded-lg py-2 px-3 transition-all">
       <i class="fas fa-sign-out-alt"></i> ログアウト
     </button>
-    <p class="text-xs text-blue-300 text-center mt-2">官公需ポータル・協会けんぽ</p>
-    <p class="text-xs text-blue-300 text-center">企業年金連合会・防衛省系 連携</p>
+    <p class="text-xs text-blue-300 text-center mt-2">全20機関 統合検索対応</p>
   </div>
 </div>
 
@@ -1590,6 +2292,80 @@ function renderHTML(): string {
       <div id="jfc-result-area"></div>
     </div>
 
+    <!-- IPA（情報処理推進機構）ページ -->
+    <div id="page-ipa" class="page-content hidden">
+      <div class="bg-gradient-to-br from-sky-50 to-blue-50 border border-sky-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-sky-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-microchip text-sky-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">独立行政法人情報処理推進機構（IPA）調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">情報処理推進機構の入札公告情報を直接取得します。サイバーセキュリティ・DX関連案件が多数あります。</p>
+            <div class="flex flex-wrap gap-2">
+              <a href="https://www.ipa.go.jp/choutatsu/nyusatsu/index.html" target="_blank"
+                 class="text-xs bg-white border border-sky-200 text-sky-600 px-3 py-1.5 rounded-lg hover:bg-sky-50 flex items-center gap-1">
+                <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="ipa-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-sky-300"
+              onkeypress="if(event.key==='Enter') loadIpa()">
+          </div>
+          <button onclick="loadIpa()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #0ea5e9, #0284c7);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="ipa-result-area"></div>
+    </div>
+
+    <!-- 防災科研ページ -->
+    <div id="page-bosai" class="page-content hidden">
+      <div class="bg-gradient-to-br from-orange-50 to-amber-50 border border-orange-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-orange-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-hard-hat text-orange-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">国立研究開発法人防災科学技術研究所 調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">防災科研の入札公告一覧から調達情報を取得します。防災・観測システム関連案件が多数あります。</p>
+            <div class="flex flex-wrap gap-2">
+              <a href="https://www.bosai.go.jp/kokai/nyuusatsu/index.html" target="_blank"
+                 class="text-xs bg-white border border-orange-200 text-orange-600 px-3 py-1.5 rounded-lg hover:bg-orange-50 flex items-center gap-1">
+                <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="bosai-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-orange-300"
+              onkeypress="if(event.key==='Enter') loadBosai()">
+          </div>
+          <button onclick="loadBosai()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #f97316, #ea580c);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="bosai-result-area"></div>
+    </div>
+
     <!-- 防衛省（内局）ページ -->
     <div id="page-mod" class="page-content hidden">
       <div class="bg-gradient-to-br from-slate-50 to-gray-100 border border-slate-200 rounded-2xl p-6 mb-6">
@@ -1664,6 +2440,216 @@ function renderHTML(): string {
       <div id="mod-dih-result-area"></div>
     </div>
 
+    <!-- UITEC（職業能力開発総合大学校）ページ -->
+    <div id="page-uitec" class="page-content hidden">
+      <div class="bg-gradient-to-br from-emerald-50 to-teal-50 border border-emerald-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-emerald-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-graduation-cap text-emerald-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">職業能力開発総合大学校（UITEC）調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">独立行政法人高齢・障害・求職者雇用支援機構が設置する大学校の入札・調達情報を取得します。</p>
+            <a href="https://www.uitec.jeed.go.jp/topics/tender/fp2ce800000000p3.html" target="_blank"
+               class="text-xs bg-white border border-emerald-200 text-emerald-600 px-3 py-1.5 rounded-lg hover:bg-emerald-50 inline-flex items-center gap-1">
+              <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+            </a>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="uitec-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300"
+              onkeypress="if(event.key==='Enter') loadUitec()">
+          </div>
+          <button onclick="loadUitec()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #059669, #047857);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="uitec-result-area"></div>
+    </div>
+
+    <!-- 金融庁ページ -->
+    <div id="page-fsa" class="page-content hidden">
+      <div class="bg-gradient-to-br from-orange-50 to-amber-50 border border-orange-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-orange-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-chart-line text-orange-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">金融庁 調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">金融庁の入札公告・企画競争・公募公告情報を取得します。</p>
+            <a href="https://www.fsa.go.jp/choutatu/choutatu_j/nyusatu_menu.html" target="_blank"
+               class="text-xs bg-white border border-orange-200 text-orange-600 px-3 py-1.5 rounded-lg hover:bg-orange-50 inline-flex items-center gap-1">
+              <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+            </a>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="fsa-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-orange-300"
+              onkeypress="if(event.key==='Enter') loadFsa()">
+          </div>
+          <button onclick="loadFsa()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #d97706, #b45309);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="fsa-result-area"></div>
+    </div>
+
+    <!-- 大阪市デジタル統括室ページ -->
+    <div id="page-osaka" class="page-content hidden">
+      <div class="bg-gradient-to-br from-pink-50 to-rose-50 border border-pink-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-pink-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-city text-pink-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">大阪市デジタル統括室 調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">大阪市デジタル統括室が発注する業務委託・入札案件を取得します。</p>
+            <a href="https://www.city.osaka.lg.jp/templates/gyomuitaku_nyusatsuanken/98-Curr.html" target="_blank"
+               class="text-xs bg-white border border-pink-200 text-pink-600 px-3 py-1.5 rounded-lg hover:bg-pink-50 inline-flex items-center gap-1">
+              <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+            </a>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="osaka-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-pink-300"
+              onkeypress="if(event.key==='Enter') loadOsaka()">
+          </div>
+          <button onclick="loadOsaka()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #db2777, #be185d);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="osaka-result-area"></div>
+    </div>
+
+    <!-- 北海道情報政策課ページ -->
+    <div id="page-hokkaido" class="page-content hidden">
+      <div class="bg-gradient-to-br from-sky-50 to-blue-50 border border-sky-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-sky-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-snowflake text-sky-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">北海道 情報政策課 調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">北海道総務部イノベーション推進局情報政策課が発注する入札案件を取得します。</p>
+            <a href="https://www.pref.hokkaido.lg.jp/sm/jsk/a0001/b0002/" target="_blank"
+               class="text-xs bg-white border border-sky-200 text-sky-600 px-3 py-1.5 rounded-lg hover:bg-sky-50 inline-flex items-center gap-1">
+              <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+            </a>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="hokkaido-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-sky-300"
+              onkeypress="if(event.key==='Enter') loadHokkaido()">
+          </div>
+          <button onclick="loadHokkaido()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #0284c7, #0369a1);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="hokkaido-result-area"></div>
+    </div>
+
+    <!-- 今治市産業振興課ページ -->
+    <div id="page-imabari" class="page-content hidden">
+      <div class="bg-gradient-to-br from-lime-50 to-green-50 border border-lime-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-lime-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-map-marker-alt text-lime-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">今治市 産業振興課 調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">今治市産業振興課のプロポーザル案件を取得します。</p>
+            <a href="https://www.city.imabari.ehime.jp/sangyou/new.html" target="_blank"
+               class="text-xs bg-white border border-lime-200 text-lime-600 px-3 py-1.5 rounded-lg hover:bg-lime-50 inline-flex items-center gap-1">
+              <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+            </a>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="imabari-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-lime-300"
+              onkeypress="if(event.key==='Enter') loadImabari()">
+          </div>
+          <button onclick="loadImabari()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #65a30d, #4d7c0f);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="imabari-result-area"></div>
+    </div>
+
+    <!-- 長野県営業局ページ -->
+    <div id="page-nagano" class="page-content hidden">
+      <div class="bg-gradient-to-br from-purple-50 to-violet-50 border border-purple-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-purple-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-mountain text-purple-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="text-lg font-bold text-gray-800 mb-1">長野県 営業局 調達情報</h3>
+            <p class="text-sm text-gray-600 mb-3">長野県営業局のプロポーザル公募案件を取得します。</p>
+            <a href="https://www.pref.nagano.lg.jp/eigyo/0415propo.html" target="_blank"
+               class="text-xs bg-white border border-purple-200 text-purple-600 px-3 py-1.5 rounded-lg hover:bg-purple-50 inline-flex items-center gap-1">
+              <i class="fas fa-external-link-alt"></i> 公式サイトを開く
+            </a>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード</label>
+            <input id="nagano-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-300"
+              onkeypress="if(event.key==='Enter') loadNagano()">
+          </div>
+          <button onclick="loadNagano()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #7c3aed, #6d28d9);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="nagano-result-area"></div>
+    </div>
+
     <!-- 全ソース一括検索ページ -->
     <div id="page-all" class="page-content hidden">
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
@@ -1675,15 +2661,45 @@ function renderHTML(): string {
           </div>
           <div>
             <label class="block text-xs font-medium text-gray-600 mb-1">検索対象ソース</label>
-            <div class="flex flex-col gap-1.5 pt-1">
+            <div class="grid grid-cols-2 gap-1.5 pt-1">
               <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
-                <input type="checkbox" id="src-kkj" checked class="rounded text-indigo-600"> 官公需ポータル（kkj.go.jp）
+                <input type="checkbox" id="src-kkj" checked class="rounded text-indigo-600"> 官公需ポータル
               </label>
               <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
                 <input type="checkbox" id="src-kkp" checked class="rounded text-rose-600"> 協会けんぽ
               </label>
               <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
                 <input type="checkbox" id="src-pfa" checked class="rounded text-amber-600"> 企業年金連合会
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-jeed" checked class="rounded text-green-600"> JEED雇用支援機構
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-jfc" checked class="rounded text-blue-600"> 日本政策金融公庫
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-fsa" checked class="rounded text-orange-600"> 金融庁
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-uitec" checked class="rounded text-emerald-600"> 職業能力開発大学校
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-osaka" checked class="rounded text-pink-600"> 大阪市DX統括室
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-hokkaido" checked class="rounded text-sky-600"> 北海道情報政策課
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-imabari" checked class="rounded text-lime-600"> 今治市産業振興課
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-nagano" checked class="rounded text-purple-600"> 長野県営業局
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-ipa" checked class="rounded text-sky-600"> IPA情報処理推進機構
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-bosai" checked class="rounded text-orange-600"> 防災科学技術研究所
               </label>
             </div>
           </div>
@@ -1956,8 +2972,16 @@ function showPage(page) {
     service: '役務案件',
     kyoukaikenpo: '協会けんぽ 調達情報',
     pfa: '企業年金連合会 調達情報',
-    jeed: '高齢・障害・求職者雇用支援機構 調達情報',
+    jeed: 'JEED 高齢・障害・求職者雇用支援機構 調達情報',
+    uitec: '職業能力開発総合大学校（UITEC）調達情報',
     jfc: '日本政策金融公庫 調達情報',
+    fsa: '金融庁 調達情報',
+    osaka: '大阪市デジタル統括室 調達情報',
+    hokkaido: '北海道 情報政策課 調達情報',
+    imabari: '今治市 産業振興課 調達情報',
+    nagano: '長野県 営業局 調達情報',
+    ipa: 'IPA 情報処理推進機構 調達情報',
+    bosai: '防災科学技術研究所 調達情報',
     all: '全ソース一括検索',
     bookmark: 'ブックマーク',
     notify: 'メール通知設定',
@@ -1974,8 +2998,16 @@ function showPage(page) {
     kyoukaikenpo: '全国健康保険協会 公式サイトから直接取得',
     pfa: '企業年金連合会 公式サイトから直接取得',
     jeed: '独立行政法人高齢・障害・求職者雇用支援機構 公式サイトから直接取得',
+    uitec: '職業能力開発総合大学校 公式サイトから直接取得',
     jfc: '株式会社日本政策金融公庫 公式サイトから直接取得',
-    all: '官公需ポータル・協会けんぽ・企業年金連合会 3ソースを横断検索',
+    fsa: '金融庁 公式サイトから直接取得',
+    osaka: '大阪市デジタル統括室 公式サイトから直接取得',
+    hokkaido: '北海道総合振興局 情報政策課 公式サイトから直接取得',
+    imabari: '今治市産業振興課 公式サイトから直接取得',
+    nagano: '長野県営業局 公式サイトから直接取得',
+    ipa: '独立行政法人情報処理推進機構 公式サイトから直接取得',
+    bosai: '国立研究開発法人防災科学技術研究所 公式サイトから直接取得',
+    all: '官公需ポータル・協会けんぽ・企業年金連合会・JEED・JFC・IPA・防災科研・大阪市・北海道・今治市・長野県 横断検索',
     bookmark: 'ブラウザのlocalStorageに保存（このPCのみ）',
     notify: 'キーワード一致の新着案件をメールで自動通知',
     mod: '防衛省大臣官房会計課 公式サイトから直接取得',
@@ -2002,8 +3034,24 @@ function showPage(page) {
     loadPfa();
   } else if (page === 'jeed') {
     loadJeed();
+  } else if (page === 'uitec') {
+    loadUitec();
   } else if (page === 'jfc') {
     loadJfc();
+  } else if (page === 'fsa') {
+    loadFsa();
+  } else if (page === 'osaka') {
+    loadOsaka();
+  } else if (page === 'hokkaido') {
+    loadHokkaido();
+  } else if (page === 'imabari') {
+    loadImabari();
+  } else if (page === 'nagano') {
+    loadNagano();
+  } else if (page === 'ipa') {
+    loadIpa();
+  } else if (page === 'bosai') {
+    loadBosai();
   } else if (page === 'mod') {
     loadMod();
   } else if (page === 'mod-dih') {
@@ -2789,6 +3837,181 @@ async function loadJfc() {
 }
 
 // ========================
+// 共通: シンプルAPI呼び出しレンダラー
+// ========================
+function renderSimpleSourceItems(items, sourceLabel, officialUrl) {
+  if (!items || items.length === 0) {
+    return \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+      <i class="fas fa-inbox text-gray-300 text-4xl mb-4"></i>
+      <p class="text-gray-500 text-lg">案件が見つかりませんでした</p>
+      <p class="text-xs text-gray-400 mt-2">現在、公開中の案件がないか、取得できませんでした</p>
+      \${officialUrl ? \`<a href="\${escHtml(officialUrl)}" target="_blank" class="mt-4 inline-flex items-center gap-1 text-sm text-blue-600 hover:underline"><i class="fas fa-external-link-alt mr-1"></i>公式サイトで確認する</a>\` : ''}
+    </div>\`;
+  }
+  let html = \`<div class="bg-white rounded-2xl shadow-sm border border-gray-100">
+    <div class="p-5 border-b border-gray-100">
+      <h3 class="font-bold text-gray-800 flex items-center gap-2">
+        <i class="fas fa-list text-blue-500"></i> \${escHtml(sourceLabel)} 調達情報
+        <span class="ml-2 text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full font-normal">\${items.length} 件</span>
+      </h3>
+    </div>
+    <div class="divide-y divide-gray-50">\`;
+  items.forEach(item => { html += renderAllItem(item); });
+  html += \`</div>
+    <div class="p-4 border-t border-gray-100 text-center">
+      <a href="\${escHtml(officialUrl)}" target="_blank" class="text-xs text-gray-400 hover:text-blue-500">
+        <i class="fas fa-external-link-alt mr-1"></i>データ出典: \${escHtml(officialUrl)}
+      </a>
+    </div>
+  </div>\`;
+  return html;
+}
+
+// ========================
+// UITEC（職業能力開発総合大学校）
+// ========================
+async function loadUitec() {
+  const area = document.getElementById('uitec-result-area');
+  const query = document.getElementById('uitec-query').value.trim();
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">職業能力開発総合大学校から調達情報を取得中...</p></div></div>\`;
+  try {
+    const params = {};
+    if (query) params.keyword = query;
+    const res = await axios.get('/api/uitec', { params });
+    area.innerHTML = renderSimpleSourceItems(res.data.items, '職業能力開発総合大学校', 'https://www.uitec.jeed.go.jp/topics/tender/fp2ce800000000p3.html');
+    searchResults = res.data.items || [];
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100"><p class="text-gray-600">取得に失敗しました</p><p class="text-xs text-gray-400 mt-1">\${e.message}</p></div>\`;
+  }
+}
+
+// ========================
+// 金融庁
+// ========================
+async function loadFsa() {
+  const area = document.getElementById('fsa-result-area');
+  const query = document.getElementById('fsa-query').value.trim();
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">金融庁から調達情報を取得中...</p></div></div>\`;
+  try {
+    const params = {};
+    if (query) params.keyword = query;
+    const res = await axios.get('/api/fsa', { params });
+    area.innerHTML = renderSimpleSourceItems(res.data.items, '金融庁', 'https://www.fsa.go.jp/choutatu/choutatu_j/nyusatu_menu.html');
+    searchResults = res.data.items || [];
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100"><p class="text-gray-600">取得に失敗しました</p><p class="text-xs text-gray-400 mt-1">\${e.message}</p></div>\`;
+  }
+}
+
+// ========================
+// 大阪市デジタル統括室
+// ========================
+async function loadOsaka() {
+  const area = document.getElementById('osaka-result-area');
+  const query = document.getElementById('osaka-query').value.trim();
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">大阪市デジタル統括室から調達情報を取得中...</p></div></div>\`;
+  try {
+    const params = {};
+    if (query) params.keyword = query;
+    const res = await axios.get('/api/osaka', { params });
+    area.innerHTML = renderSimpleSourceItems(res.data.items, '大阪市デジタル統括室', 'https://www.city.osaka.lg.jp/templates/gyomuitaku_nyusatsuanken/98-Curr.html');
+    searchResults = res.data.items || [];
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100"><p class="text-gray-600">取得に失敗しました</p><p class="text-xs text-gray-400 mt-1">\${e.message}</p></div>\`;
+  }
+}
+
+// ========================
+// 北海道情報政策課
+// ========================
+async function loadHokkaido() {
+  const area = document.getElementById('hokkaido-result-area');
+  const query = document.getElementById('hokkaido-query').value.trim();
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">北海道 情報政策課から調達情報を取得中...</p></div></div>\`;
+  try {
+    const params = {};
+    if (query) params.keyword = query;
+    const res = await axios.get('/api/hokkaido', { params });
+    area.innerHTML = renderSimpleSourceItems(res.data.items, '北海道 情報政策課', 'https://www.pref.hokkaido.lg.jp/sm/jsk/a0001/b0002/');
+    searchResults = res.data.items || [];
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100"><p class="text-gray-600">取得に失敗しました</p><p class="text-xs text-gray-400 mt-1">\${e.message}</p></div>\`;
+  }
+}
+
+// ========================
+// 今治市産業振興課
+// ========================
+async function loadImabari() {
+  const area = document.getElementById('imabari-result-area');
+  const query = document.getElementById('imabari-query').value.trim();
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">今治市 産業振興課から調達情報を取得中...</p></div></div>\`;
+  try {
+    const params = {};
+    if (query) params.keyword = query;
+    const res = await axios.get('/api/imabari', { params });
+    area.innerHTML = renderSimpleSourceItems(res.data.items, '今治市 産業振興課', 'https://www.city.imabari.ehime.jp/sangyou/new.html');
+    searchResults = res.data.items || [];
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100"><p class="text-gray-600">取得に失敗しました</p><p class="text-xs text-gray-400 mt-1">\${e.message}</p></div>\`;
+  }
+}
+
+// ========================
+// 長野県営業局
+// ========================
+async function loadNagano() {
+  const area = document.getElementById('nagano-result-area');
+  const query = document.getElementById('nagano-query').value.trim();
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">長野県 営業局から調達情報を取得中...</p></div></div>\`;
+  try {
+    const params = {};
+    if (query) params.keyword = query;
+    const res = await axios.get('/api/nagano', { params });
+    area.innerHTML = renderSimpleSourceItems(res.data.items, '長野県 営業局', 'https://www.pref.nagano.lg.jp/eigyo/0415propo.html');
+    searchResults = res.data.items || [];
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100"><p class="text-gray-600">取得に失敗しました</p><p class="text-xs text-gray-400 mt-1">\${e.message}</p></div>\`;
+  }
+}
+
+// ========================
+// IPA（情報処理推進機構）
+// ========================
+async function loadIpa() {
+  const area = document.getElementById('ipa-result-area');
+  const query = document.getElementById('ipa-query').value.trim();
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">IPAから調達情報を取得中...</p></div></div>\`;
+  try {
+    const params = {};
+    if (query) params.keyword = query;
+    const res = await axios.get('/api/ipa', { params });
+    area.innerHTML = renderSimpleSourceItems(res.data.items, 'IPA 情報処理推進機構', 'https://www.ipa.go.jp/choutatsu/nyusatsu/index.html');
+    searchResults = res.data.items || [];
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100"><p class="text-gray-600">取得に失敗しました</p><p class="text-xs text-gray-400 mt-1">\${e.message}</p></div>\`;
+  }
+}
+
+// ========================
+// 防災科研（防災科学技術研究所）
+// ========================
+async function loadBosai() {
+  const area = document.getElementById('bosai-result-area');
+  const query = document.getElementById('bosai-query').value.trim();
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">防災科研から調達情報を取得中...</p></div></div>\`;
+  try {
+    const params = {};
+    if (query) params.keyword = query;
+    const res = await axios.get('/api/bosai', { params });
+    area.innerHTML = renderSimpleSourceItems(res.data.items, '防災科学技術研究所', 'https://www.bosai.go.jp/kokai/nyuusatsu/index.html');
+    searchResults = res.data.items || [];
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100"><p class="text-gray-600">取得に失敗しました</p><p class="text-xs text-gray-400 mt-1">\${e.message}</p></div>\`;
+  }
+}
+
+// ========================
 // 防衛省（内局）
 // ========================
 async function loadMod() {
@@ -2971,8 +4194,18 @@ async function loadAll() {
   const useSrcKkj = document.getElementById('src-kkj').checked;
   const useSrcKkp = document.getElementById('src-kkp').checked;
   const useSrcPfa = document.getElementById('src-pfa').checked;
+  const useSrcJeed = document.getElementById('src-jeed').checked;
+  const useSrcJfc = document.getElementById('src-jfc').checked;
+  const useSrcFsa = document.getElementById('src-fsa').checked;
+  const useSrcUitec = document.getElementById('src-uitec').checked;
+  const useSrcOsaka = document.getElementById('src-osaka').checked;
+  const useSrcHokkaido = document.getElementById('src-hokkaido').checked;
+  const useSrcImabari = document.getElementById('src-imabari').checked;
+  const useSrcNagano = document.getElementById('src-nagano').checked;
+  const useSrcIpa = document.getElementById('src-ipa').checked;
+  const useSrcBosai = document.getElementById('src-bosai').checked;
 
-  if (!useSrcKkj && !useSrcKkp && !useSrcPfa) {
+  if (!useSrcKkj && !useSrcKkp && !useSrcPfa && !useSrcJeed && !useSrcJfc && !useSrcFsa && !useSrcUitec && !useSrcOsaka && !useSrcHokkaido && !useSrcImabari && !useSrcNagano && !useSrcIpa && !useSrcBosai) {
     area.innerHTML = \`<div class="text-center py-8 bg-white rounded-2xl border border-gray-100">
       <p class="text-gray-500">検索対象ソースを1つ以上選択してください</p>
     </div>\`;
@@ -2986,6 +4219,16 @@ async function loadAll() {
     if (useSrcKkj) sources.push('kkj');
     if (useSrcKkp) sources.push('kyoukaikenpo');
     if (useSrcPfa) sources.push('pfa');
+    if (useSrcJeed) sources.push('jeed');
+    if (useSrcJfc) sources.push('jfc');
+    if (useSrcFsa) sources.push('fsa');
+    if (useSrcUitec) sources.push('uitec');
+    if (useSrcOsaka) sources.push('osaka');
+    if (useSrcHokkaido) sources.push('hokkaido');
+    if (useSrcImabari) sources.push('imabari');
+    if (useSrcNagano) sources.push('nagano');
+    if (useSrcIpa) sources.push('ipa');
+    if (useSrcBosai) sources.push('bosai');
 
     const allSfName = document.getElementById('all-sf-name')?.checked;
     const allSfDesc = document.getElementById('all-sf-desc')?.checked;
@@ -3578,6 +4821,117 @@ async function runNotifyCheck(env: {
     totalChecked += items.length
   } catch (e) {
     errors.push(`JFC: ${String(e)}`)
+  }
+
+  // 金融庁
+  try {
+    const res = await fetch('https://www.fsa.go.jp/choutatu/choutatu_j/nyusatu_menu.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    const html = await res.text()
+    const items = scrapeFsa(html)
+    items.forEach((item: any) => allItems.push(item))
+    totalChecked += items.length
+  } catch (e) {
+    errors.push(`金融庁: ${String(e)}`)
+  }
+
+  // UITEC（職業能力開発総合大学校）
+  try {
+    const pages = [
+      'https://www.uitec.jeed.go.jp/topics/tender/fp2ce800000000p3.html',
+      'https://www.uitec.jeed.go.jp/topics/tender/ka7cok0000005u3v.html',
+    ]
+    for (const url of pages) {
+      try {
+        const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' } })
+        if (r.ok) {
+          const items = scrapeUitec(await r.text())
+          items.forEach((item: any) => allItems.push(item))
+          totalChecked += items.length
+        }
+      } catch (_) {}
+    }
+  } catch (e) {
+    errors.push(`UITEC: ${String(e)}`)
+  }
+
+  // 大阪市デジタル統括室
+  try {
+    const res = await fetch('https://www.city.osaka.lg.jp/templates/gyomuitaku_nyusatsuanken/98-Curr.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    const html = await res.text()
+    const items = scrapeOsakaCity(html)
+    items.forEach((item: any) => allItems.push(item))
+    totalChecked += items.length
+  } catch (e) {
+    errors.push(`大阪市: ${String(e)}`)
+  }
+
+  // 北海道情報政策課
+  try {
+    const res = await fetch('https://www.pref.hokkaido.lg.jp/sm/jsk/a0001/b0002/', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    const html = await res.text()
+    const items = scrapeHokkaido(html)
+    items.forEach((item: any) => allItems.push(item))
+    totalChecked += items.length
+  } catch (e) {
+    errors.push(`北海道: ${String(e)}`)
+  }
+
+  // 今治市産業振興課
+  try {
+    const res = await fetch('https://www.city.imabari.ehime.jp/sangyou/new.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    const html = await res.text()
+    const items = scrapeImabari(html)
+    items.forEach((item: any) => allItems.push(item))
+    totalChecked += items.length
+  } catch (e) {
+    errors.push(`今治市: ${String(e)}`)
+  }
+
+  // 長野県営業局
+  try {
+    const res = await fetch('https://www.pref.nagano.lg.jp/eigyo/0415propo.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    const html = await res.text()
+    const items = scrapeNagano(html)
+    items.forEach((item: any) => allItems.push(item))
+    totalChecked += items.length
+  } catch (e) {
+    errors.push(`長野県: ${String(e)}`)
+  }
+
+  // IPA（情報処理推進機構）
+  try {
+    const res = await fetch('https://www.ipa.go.jp/choutatsu/nyusatsu/2026/index.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    const html = await res.text()
+    const items = scrapeIpa(html)
+    items.forEach((item: any) => allItems.push(item))
+    totalChecked += items.length
+  } catch (e) {
+    errors.push(`IPA: ${String(e)}`)
+  }
+
+  // 防災科研
+  try {
+    const res = await fetch('https://www.bosai.go.jp/kokai/nyuusatsu/index.html', {
+      headers: { 'User-Agent': 'Mozilla/5.0 BidSearchApp/1.0' }
+    })
+    const html = await res.text()
+    const items = scrapeBosai(html)
+    items.forEach((item: any) => allItems.push(item))
+    totalChecked += items.length
+  } catch (e) {
+    errors.push(`防災科研: ${String(e)}`)
   }
 
   // キーワードフィルタリング & 新着判定（案件名＋説明文＋機関名）
