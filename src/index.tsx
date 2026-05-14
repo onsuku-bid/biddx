@@ -1056,6 +1056,98 @@ app.get('/api/search-all', async (c) => {
 })
 
 // =============================
+// KKJ 機関名フィルタ API
+// 機関名でKKJを絞り込み取得するエンドポイント
+// =============================
+
+// KKJ経由で対応できる機関マスタ
+const KKJ_ORG_MASTER: Record<string, { label: string; searchName: string; icon: string; group: string }> = {
+  'jilpt':    { label: '労働政策研究・研修機構',        searchName: '独立行政法人労働政策研究・研修機構',        icon: 'fas fa-book-open',      group: '独法・研究機関（KKJ）' },
+  'nho':      { label: '国立病院機構',                  searchName: '独立行政法人国立病院機構',                  icon: 'fas fa-hospital',       group: '独法・研究機関（KKJ）' },
+  'johas':    { label: '労働者健康安全機構',            searchName: '独立行政法人労働者健康安全機構',            icon: 'fas fa-hard-hat',       group: '独法・研究機関（KKJ）' },
+  'nedo':     { label: 'NEDO 新エネルギー・産業技術総合開発機構', searchName: '国立研究開発法人新エネルギー・産業技術総合開発機構', icon: 'fas fa-bolt',   group: '独法・研究機関（KKJ）' },
+  'jaea':     { label: 'JAEA 日本原子力研究開発機構',  searchName: '国立研究開発法人日本原子力研究開発機構',    icon: 'fas fa-atom',           group: '独法・研究機関（KKJ）' },
+  'riken':    { label: '理化学研究所',                  searchName: '国立研究開発法人理化学研究所',              icon: 'fas fa-flask',          group: '独法・研究機関（KKJ）' },
+  'qst':      { label: 'QST 量子科学技術研究開発機構', searchName: '国立研究開発法人量子科学技術研究開発機構',  icon: 'fas fa-radiation',      group: '独法・研究機関（KKJ）' },
+  'jst':      { label: 'JST 科学技術振興機構',          searchName: '国立研究開発法人科学技術振興機構',          icon: 'fas fa-satellite',      group: '独法・研究機関（KKJ）' },
+  'pmda':     { label: 'PMDA 医薬品医療機器総合機構',  searchName: '独立行政法人医薬品医療機器総合機構',        icon: 'fas fa-pills',          group: '独法・研究機関（KKJ）' },
+  'jpf':      { label: '国際交流基金',                  searchName: '独立行政法人国際交流基金',                  icon: 'fas fa-globe-asia',     group: '独法・研究機関（KKJ）' },
+  'jsc':      { label: '日本スポーツ振興センター',      searchName: '独立行政法人日本スポーツ振興センター',      icon: 'fas fa-running',        group: '独法・研究機関（KKJ）' },
+  'jka':      { label: '公益財団法人JKA',               searchName: '公益財団法人JKA',                          icon: 'fas fa-bicycle',        group: '独法・研究機関（KKJ）' },
+  'ncac':     { label: '日本芸術文化振興会',            searchName: '独立行政法人日本芸術文化振興会',            icon: 'fas fa-theater-masks',  group: '独法・研究機関（KKJ）' },
+  'tiro':     { label: '勤労者退職金共済機構',          searchName: '独立行政法人勤労者退職金共済機構',          icon: 'fas fa-coins',          group: '独法・研究機関（KKJ）' },
+  'jetro':    { label: 'JETRO 日本貿易振興機構',        searchName: '独立行政法人日本貿易振興機構',              icon: 'fas fa-ship',           group: '独法・研究機関（KKJ）' },
+  'mint':     { label: '造幣局',                        searchName: '独立行政法人造幣局',                        icon: 'fas fa-coins',          group: '独法・研究機関（KKJ）' },
+  'jsps':     { label: '日本学術振興会',                searchName: '独立行政法人日本学術振興会',                icon: 'fas fa-graduation-cap', group: '独法・研究機関（KKJ）' },
+  'jcho':     { label: '地域医療機能推進機構',          searchName: '独立行政法人地域医療機能推進機構',          icon: 'fas fa-clinic-medical', group: '独法・研究機関（KKJ）' },
+  'nabunken': { label: '奈良文化財研究所',              searchName: '独立行政法人国立文化財機構奈良文化財研究所',icon: 'fas fa-torii-gate',     group: '独法・研究機関（KKJ）' },
+  'nam':      { label: '国立美術館',                    searchName: '独立行政法人国立美術館',                    icon: 'fas fa-palette',        group: '独法・研究機関（KKJ）' },
+  'niad':     { label: '大学改革支援・学位授与機構',   searchName: '独立行政法人大学改革支援・学位授与機構',    icon: 'fas fa-university',     group: '独法・研究機関（KKJ）' },
+  'nmc':      { label: '三重県立看護大学',              searchName: '公立大学法人三重県立看護大学',              icon: 'fas fa-user-nurse',     group: '独法・研究機関（KKJ）' },
+  'nies':     { label: '国立教育政策研究所',            searchName: '国立教育政策研究所',                        icon: 'fas fa-school',         group: '独法・研究機関（KKJ）' },
+  'ncc':      { label: '国立がん研究センター',          searchName: '国立研究開発法人国立がん研究センター',      icon: 'fas fa-ribbon',         group: '独法・研究機関（KKJ）' },
+  'ncvc':     { label: '国立循環器病研究センター',      searchName: '国立研究開発法人国立循環器病研究センター',  icon: 'fas fa-heartbeat',      group: '独法・研究機関（KKJ）' },
+  'ncchd':    { label: '国立成育医療研究センター',      searchName: '国立研究開発法人国立成育医療研究センター',  icon: 'fas fa-baby',           group: '独法・研究機関（KKJ）' },
+  'pari':     { label: '海上・港湾・航空技術研究所',   searchName: '国立研究開発法人海上・港湾・航空技術研究所',icon: 'fas fa-anchor',         group: '独法・研究機関（KKJ）' },
+  'naro':     { label: '農業・食品産業技術総合研究機構',searchName: '国立研究開発法人農業・食品産業技術総合研究機構', icon: 'fas fa-seedling',  group: '独法・研究機関（KKJ）' },
+  'jica':     { label: 'JICA 国際協力機構',             searchName: '独立行政法人国際協力機構',                  icon: 'fas fa-hands-helping',  group: '独法・研究機関（KKJ）' },
+}
+
+// KKJ機関名フィルタAPIエンドポイント
+app.get('/api/kkj-org', async (c) => {
+  const orgKey = c.req.query('org') || ''
+  const keyword = c.req.query('keyword') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  const count = parseInt(c.req.query('count') || '50')
+
+  const orgInfo = KKJ_ORG_MASTER[orgKey]
+  if (!orgInfo) {
+    return c.json({ error: `不明な機関コード: ${orgKey}`, availableOrgs: Object.keys(KKJ_ORG_MASTER) }, 400)
+  }
+
+  const searchName = orgInfo.searchName
+  const params = new URLSearchParams({
+    Query: searchName,
+    Count: String(Math.min(count, 100)),
+  })
+
+  try {
+    const res = await fetch(`http://www.kkj.go.jp/api/?${params.toString()}`, {
+      headers: { 'User-Agent': 'BidSearchApp/1.0' }
+    })
+    const xml = await res.text()
+    const parsed = parseKkjXml(xml)
+
+    // 機関名で後絞り込み（KKJのQuery検索は部分一致のため余分なものが混じる場合あり）
+    let items: any[] = (parsed.items || []).map((item: any) => ({
+      ...item,
+      source: orgInfo.label,
+      organizationGroup: orgInfo.label,
+    }))
+
+    // キーワードフィルタ
+    if (keyword) {
+      items = filterItemsByKeyword(items, keyword, searchFields)
+    }
+
+    return c.json({
+      source: orgInfo.label,
+      searchName,
+      totalHits: items.length,
+      kkjTotalHits: parsed.totalHits || 0,
+      items,
+    })
+  } catch (e) {
+    return c.json({ error: `取得失敗: ${String(e)}` }, 500)
+  }
+})
+
+// KKJ機関マスタ一覧取得API
+app.get('/api/kkj-org/list', (c) => {
+  return c.json({ orgs: KKJ_ORG_MASTER })
+})
+
+// =============================
 // 官公需API プロキシエンドポイント
 // =============================
 
@@ -1807,6 +1899,94 @@ function renderHTML(): string {
     <a href="#" onclick="showPage('bosai')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-bosai">
       <i class="fas fa-hard-hat w-4"></i> 防災科学技術研究所
     </a>
+    <!-- KKJ経由 独法・研究機関 -->
+    <a href="#" onclick="showKkjOrg('jilpt')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-jilpt">
+      <i class="fas fa-book-open w-4"></i> 労働政策研究・研修機構
+    </a>
+    <a href="#" onclick="showKkjOrg('nho')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-nho">
+      <i class="fas fa-hospital w-4"></i> 国立病院機構
+    </a>
+    <a href="#" onclick="showKkjOrg('johas')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-johas">
+      <i class="fas fa-hard-hat w-4"></i> 労働者健康安全機構
+    </a>
+    <a href="#" onclick="showKkjOrg('nedo')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-nedo">
+      <i class="fas fa-bolt w-4"></i> NEDO
+    </a>
+    <a href="#" onclick="showKkjOrg('jaea')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-jaea">
+      <i class="fas fa-atom w-4"></i> JAEA 原子力機構
+    </a>
+    <a href="#" onclick="showKkjOrg('riken')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-riken">
+      <i class="fas fa-flask w-4"></i> 理化学研究所
+    </a>
+    <a href="#" onclick="showKkjOrg('qst')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-qst">
+      <i class="fas fa-radiation w-4"></i> QST 量子科学技術
+    </a>
+    <a href="#" onclick="showKkjOrg('jst')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-jst">
+      <i class="fas fa-satellite w-4"></i> JST 科学技術振興機構
+    </a>
+    <a href="#" onclick="showKkjOrg('pmda')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-pmda">
+      <i class="fas fa-pills w-4"></i> PMDA 医薬品機器総合機構
+    </a>
+    <a href="#" onclick="showKkjOrg('ncc')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-ncc">
+      <i class="fas fa-ribbon w-4"></i> 国立がん研究センター
+    </a>
+    <a href="#" onclick="showKkjOrg('ncvc')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-ncvc">
+      <i class="fas fa-heartbeat w-4"></i> 国立循環器病研究センター
+    </a>
+    <a href="#" onclick="showKkjOrg('ncchd')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-ncchd">
+      <i class="fas fa-baby w-4"></i> 国立成育医療研究センター
+    </a>
+    <a href="#" onclick="showKkjOrg('naro')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-naro">
+      <i class="fas fa-seedling w-4"></i> 農研機構
+    </a>
+    <a href="#" onclick="showKkjOrg('pari')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-pari">
+      <i class="fas fa-anchor w-4"></i> 海上・港湾・航空技術研究所
+    </a>
+    <a href="#" onclick="showKkjOrg('jpf')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-jpf">
+      <i class="fas fa-globe-asia w-4"></i> 国際交流基金
+    </a>
+    <a href="#" onclick="showKkjOrg('jica')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-jica">
+      <i class="fas fa-hands-helping w-4"></i> JICA 国際協力機構
+    </a>
+    <a href="#" onclick="showKkjOrg('jetro')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-jetro">
+      <i class="fas fa-ship w-4"></i> JETRO 日本貿易振興機構
+    </a>
+    <a href="#" onclick="showKkjOrg('jsc')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-jsc">
+      <i class="fas fa-running w-4"></i> 日本スポーツ振興センター
+    </a>
+    <a href="#" onclick="showKkjOrg('jsps')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-jsps">
+      <i class="fas fa-graduation-cap w-4"></i> 日本学術振興会
+    </a>
+    <a href="#" onclick="showKkjOrg('jcho')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-jcho">
+      <i class="fas fa-clinic-medical w-4"></i> 地域医療機能推進機構
+    </a>
+    <a href="#" onclick="showKkjOrg('ncac')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-ncac">
+      <i class="fas fa-theater-masks w-4"></i> 日本芸術文化振興会
+    </a>
+    <a href="#" onclick="showKkjOrg('tiro')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-tiro">
+      <i class="fas fa-coins w-4"></i> 勤労者退職金共済機構
+    </a>
+    <a href="#" onclick="showKkjOrg('mint')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-mint">
+      <i class="fas fa-coins w-4"></i> 造幣局
+    </a>
+    <a href="#" onclick="showKkjOrg('jka')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-jka">
+      <i class="fas fa-bicycle w-4"></i> JKA
+    </a>
+    <a href="#" onclick="showKkjOrg('nabunken')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-nabunken">
+      <i class="fas fa-torii-gate w-4"></i> 奈良文化財研究所
+    </a>
+    <a href="#" onclick="showKkjOrg('nam')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-nam">
+      <i class="fas fa-palette w-4"></i> 国立美術館
+    </a>
+    <a href="#" onclick="showKkjOrg('niad')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-niad">
+      <i class="fas fa-university w-4"></i> 大学改革支援・学位授与機構
+    </a>
+    <a href="#" onclick="showKkjOrg('nies')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-nies">
+      <i class="fas fa-school w-4"></i> 国立教育政策研究所
+    </a>
+    <a href="#" onclick="showKkjOrg('nmc')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kkjorg-nmc">
+      <i class="fas fa-user-nurse w-4"></i> 三重県立看護大学
+    </a>
     <div class="border-t border-white/20 my-2"></div>
     <p class="text-xs text-blue-300 px-4 py-1 font-medium uppercase tracking-wider">社会保険・金融</p>
     <a href="#" onclick="showPage('kyoukaikenpo')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-kyoukaikenpo">
@@ -2364,6 +2544,43 @@ function renderHTML(): string {
         </div>
       </div>
       <div id="bosai-result-area"></div>
+    </div>
+
+    <!-- KKJ機関 共通ページ（showKkjOrg()で動的に内容を書き換え） -->
+    <div id="page-kkjorg" class="page-content hidden">
+      <div id="kkjorg-header-area" class="bg-gradient-to-br from-indigo-50 to-blue-50 border border-indigo-100 rounded-2xl p-6 mb-6">
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 bg-indigo-100 rounded-2xl flex items-center justify-center flex-shrink-0">
+            <i id="kkjorg-icon" class="fas fa-building text-indigo-600 text-2xl"></i>
+          </div>
+          <div class="flex-1">
+            <h3 id="kkjorg-title" class="text-lg font-bold text-gray-800 mb-1">機関名</h3>
+            <p id="kkjorg-desc" class="text-sm text-gray-600 mb-2">官公需ポータル（KKJ）経由で調達情報を取得します。</p>
+            <div class="flex items-center gap-2">
+              <span class="text-xs bg-indigo-100 text-indigo-700 px-2 py-1 rounded-lg">
+                <i class="fas fa-database mr-1"></i>KKJ経由
+              </span>
+              <span id="kkjorg-kkj-hits" class="text-xs text-gray-500"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 mb-6">
+        <div class="flex flex-wrap items-end gap-4">
+          <div class="flex-1 min-w-48">
+            <label class="block text-xs font-medium text-gray-600 mb-1">キーワード絞り込み</label>
+            <input id="kkjorg-query" type="text" placeholder="案件名で絞り込み..."
+              class="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              onkeypress="if(event.key==='Enter') loadKkjOrg()">
+          </div>
+          <button onclick="loadKkjOrg()"
+            class="px-6 py-2.5 rounded-xl font-medium text-sm text-white shadow-md flex items-center gap-2"
+            style="background: linear-gradient(135deg, #6366f1, #4f46e5);">
+            <i class="fas fa-search"></i> 取得する
+          </button>
+        </div>
+      </div>
+      <div id="kkjorg-result-area"></div>
     </div>
 
     <!-- 防衛省（内局）ページ -->
@@ -2987,6 +3204,7 @@ function showPage(page) {
     notify: 'メール通知設定',
     mod: '防衛省（内局）調達情報',
     'mod-dih': '防衛省情報本部 調達情報',
+    kkjorg: '調達情報（官公需ポータル経由）',
   };
   const subtitles = {
     dashboard: '官公需ポータル・協会けんぽ・企業年金連合会のリアルタイムデータ',
@@ -3012,6 +3230,7 @@ function showPage(page) {
     notify: 'キーワード一致の新着案件をメールで自動通知',
     mod: '防衛省大臣官房会計課 公式サイトから直接取得',
     'mod-dih': '防衛省情報本部 公式サイトから直接取得',
+    kkjorg: '官公需ポータル（kkj.go.jp）経由で機関名絞り込み取得',
   };
   document.getElementById('page-title').textContent = titles[page] || page;
   const subtitleEl = document.getElementById('page-subtitle');
@@ -4008,6 +4227,154 @@ async function loadBosai() {
     searchResults = res.data.items || [];
   } catch(e) {
     area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100"><p class="text-gray-600">取得に失敗しました</p><p class="text-xs text-gray-400 mt-1">\${e.message}</p></div>\`;
+  }
+}
+
+// ========================
+// KKJ機関ページ（共通）
+// ========================
+
+// KKJ機関マスタ（フロントエンド側コピー）
+const KKJ_ORG_META = {
+  jilpt:    { label: '独立行政法人労働政策研究・研修機構',        icon: 'fas fa-book-open',      color: '#6366f1' },
+  nho:      { label: '独立行政法人国立病院機構',                  icon: 'fas fa-hospital',       color: '#6366f1' },
+  johas:    { label: '独立行政法人労働者健康安全機構',            icon: 'fas fa-hard-hat',       color: '#6366f1' },
+  nedo:     { label: '国立研究開発法人新エネルギー・産業技術総合開発機構', icon: 'fas fa-bolt',   color: '#6366f1' },
+  jaea:     { label: '国立研究開発法人日本原子力研究開発機構',    icon: 'fas fa-atom',           color: '#6366f1' },
+  riken:    { label: '国立研究開発法人理化学研究所',              icon: 'fas fa-flask',          color: '#6366f1' },
+  qst:      { label: '国立研究開発法人量子科学技術研究開発機構',  icon: 'fas fa-radiation',      color: '#6366f1' },
+  jst:      { label: '国立研究開発法人科学技術振興機構',          icon: 'fas fa-satellite',      color: '#6366f1' },
+  pmda:     { label: '独立行政法人医薬品医療機器総合機構',        icon: 'fas fa-pills',          color: '#6366f1' },
+  jpf:      { label: '独立行政法人国際交流基金',                  icon: 'fas fa-globe-asia',     color: '#6366f1' },
+  jsc:      { label: '独立行政法人日本スポーツ振興センター',      icon: 'fas fa-running',        color: '#6366f1' },
+  jka:      { label: '公益財団法人JKA',                           icon: 'fas fa-bicycle',        color: '#6366f1' },
+  ncac:     { label: '独立行政法人日本芸術文化振興会',            icon: 'fas fa-theater-masks',  color: '#6366f1' },
+  tiro:     { label: '独立行政法人勤労者退職金共済機構',          icon: 'fas fa-coins',          color: '#6366f1' },
+  jetro:    { label: '独立行政法人日本貿易振興機構',              icon: 'fas fa-ship',           color: '#6366f1' },
+  mint:     { label: '独立行政法人造幣局',                        icon: 'fas fa-coins',          color: '#6366f1' },
+  jsps:     { label: '独立行政法人日本学術振興会',                icon: 'fas fa-graduation-cap', color: '#6366f1' },
+  jcho:     { label: '独立行政法人地域医療機能推進機構',          icon: 'fas fa-clinic-medical', color: '#6366f1' },
+  nabunken: { label: '独立行政法人国立文化財機構奈良文化財研究所',icon: 'fas fa-torii-gate',     color: '#6366f1' },
+  nam:      { label: '独立行政法人国立美術館',                    icon: 'fas fa-palette',        color: '#6366f1' },
+  niad:     { label: '独立行政法人大学改革支援・学位授与機構',    icon: 'fas fa-university',     color: '#6366f1' },
+  nmc:      { label: '公立大学法人三重県立看護大学',              icon: 'fas fa-user-nurse',     color: '#6366f1' },
+  nies:     { label: '国立教育政策研究所',                        icon: 'fas fa-school',         color: '#6366f1' },
+  ncc:      { label: '国立研究開発法人国立がん研究センター',      icon: 'fas fa-ribbon',         color: '#6366f1' },
+  ncvc:     { label: '国立研究開発法人国立循環器病研究センター',  icon: 'fas fa-heartbeat',      color: '#6366f1' },
+  ncchd:    { label: '国立研究開発法人国立成育医療研究センター',  icon: 'fas fa-baby',           color: '#6366f1' },
+  pari:     { label: '国立研究開発法人海上・港湾・航空技術研究所',icon: 'fas fa-anchor',         color: '#6366f1' },
+  naro:     { label: '国立研究開発法人農業・食品産業技術総合研究機構', icon: 'fas fa-seedling',  color: '#6366f1' },
+  jica:     { label: '独立行政法人国際協力機構',                  icon: 'fas fa-hands-helping',  color: '#6366f1' },
+};
+
+let currentKkjOrgKey = '';
+
+function showKkjOrg(orgKey) {
+  const meta = KKJ_ORG_META[orgKey];
+  if (!meta) return;
+
+  currentKkjOrgKey = orgKey;
+
+  // アイコン・タイトル・説明を更新
+  document.getElementById('kkjorg-icon').className = meta.icon + ' text-indigo-600 text-2xl';
+  document.getElementById('kkjorg-title').textContent = meta.label + ' 調達情報';
+  document.getElementById('kkjorg-desc').textContent = '官公需ポータル（KKJ）経由で' + meta.label + 'の調達情報を取得します。';
+  document.getElementById('kkjorg-kkj-hits').textContent = '';
+  document.getElementById('kkjorg-query').value = '';
+  document.getElementById('kkjorg-result-area').innerHTML = '';
+
+  // サイドバーのアクティブ状態を更新（kkjorgページに切り替え）
+  showPage('kkjorg');
+
+  // ナビゲーションのアクティブ状態を kkjorg-{orgKey} に移す
+  document.querySelectorAll('.sidebar-link').forEach(el => el.classList.remove('active'));
+  const navEl = document.getElementById('nav-kkjorg-' + orgKey);
+  if (navEl) navEl.classList.add('active');
+
+  // ページタイトルを機関名に更新
+  document.getElementById('page-title').textContent = meta.label + ' 調達情報';
+  document.getElementById('page-subtitle').textContent = '官公需ポータル（kkj.go.jp）経由で機関名絞り込み取得';
+
+  // 自動ロード
+  loadKkjOrg();
+}
+
+async function loadKkjOrg() {
+  if (!currentKkjOrgKey) return;
+  const area = document.getElementById('kkjorg-result-area');
+  const query = document.getElementById('kkjorg-query').value.trim();
+  const meta = KKJ_ORG_META[currentKkjOrgKey];
+
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">\${escHtml(meta.label)}から調達情報を取得中...</p></div></div>\`;
+
+  try {
+    const params = { org: currentKkjOrgKey };
+    if (query) params.keyword = query;
+    const res = await axios.get('/api/kkj-org', { params, headers: authHeaders() });
+    const data = res.data;
+    const items = data.items || [];
+
+    // KKJ総ヒット数を表示
+    if (data.kkjTotalHits) {
+      document.getElementById('kkjorg-kkj-hits').textContent = \`KKJ全体: \${data.kkjTotalHits.toLocaleString()}件\`;
+    }
+
+    if (items.length === 0) {
+      area.innerHTML = \`<div class="text-center py-16 text-gray-500">
+        <i class="fas fa-inbox text-4xl mb-4 text-gray-300"></i>
+        <p class="font-medium">案件が見つかりませんでした</p>
+        <p class="text-sm mt-1">キーワードを変えて再検索してください</p>
+        </div>\`;
+      return;
+    }
+
+    const html = \`
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+        <div class="px-5 py-3 border-b border-gray-100 flex items-center justify-between">
+          <span class="text-sm font-medium text-gray-700">
+            <i class="fas fa-list mr-2 text-indigo-400"></i>\${items.length}件の案件
+            \${query ? \`（"<span class="text-indigo-600">\${escHtml(query)}</span>" で絞り込み）\` : ''}
+          </span>
+          <a href="https://www.kkj.go.jp/" target="_blank"
+             class="text-xs text-gray-400 hover:text-gray-600 flex items-center gap-1">
+            <i class="fas fa-external-link-alt"></i> KKJ公式
+          </a>
+        </div>
+        <div class="divide-y divide-gray-50">
+          \${items.map(item => {
+            const isDeadlineSoon = item.tenderDeadline && new Date(item.tenderDeadline) < new Date(Date.now() + 7*24*60*60*1000);
+            return \`<div class="p-4 hover:bg-gray-50 cursor-pointer transition-colors" onclick="openModal(\${JSON.stringify(JSON.stringify(item))})">
+              <div class="flex items-start justify-between gap-3">
+                <div class="flex-1 min-w-0">
+                  <p class="text-sm font-medium text-gray-800 leading-snug mb-1.5">\${escHtml(item.projectName || '（案件名なし）')}</p>
+                  <div class="flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                    \${item.organizationName ? \`<span class="flex items-center gap-1"><i class="fas fa-building text-gray-300"></i>\${escHtml(item.organizationName)}</span>\` : ''}
+                    \${item.cftIssueDate ? \`<span class="flex items-center gap-1"><i class="fas fa-calendar text-gray-300"></i>公告: \${item.cftIssueDate.slice(0,10)}</span>\` : ''}
+                    \${item.tenderDeadline ? \`<span class="flex items-center gap-1 \${isDeadlineSoon ? 'text-red-500 font-medium' : ''}"><i class="fas fa-clock \${isDeadlineSoon ? 'text-red-400' : 'text-gray-300'}"></i>締切: \${item.tenderDeadline.slice(0,10)}\${isDeadlineSoon ? ' ⚠' : ''}</span>\` : ''}
+                    \${item.prefectureName ? \`<span class="flex items-center gap-1"><i class="fas fa-map-marker-alt text-gray-300"></i>\${escHtml(item.prefectureName)}</span>\` : ''}
+                  </div>
+                </div>
+                <div class="flex flex-col items-end gap-1.5 flex-shrink-0">
+                  \${item.category ? \`<span class="text-xs px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-600 border border-indigo-100">\${escHtml(item.category)}</span>\` : ''}
+                  \${item.url ? \`<a href="\${escHtml(item.url)}" target="_blank" onclick="event.stopPropagation()"
+                     class="text-xs text-indigo-500 hover:text-indigo-700 flex items-center gap-1">
+                     <i class="fas fa-file-alt"></i>詳細
+                  </a>\` : ''}
+                </div>
+              </div>
+            </div>\`;
+          }).join('')}
+        </div>
+      </div>\`;
+
+    area.innerHTML = html;
+    searchResults = items;
+  } catch (err) {
+    area.innerHTML = \`<div class="text-center py-12 text-red-500">
+      <i class="fas fa-exclamation-triangle text-3xl mb-3"></i>
+      <p class="font-medium">取得エラー</p>
+      <p class="text-sm mt-1">\${escHtml(String(err))}</p>
+    </div>\`;
   }
 }
 
