@@ -5205,6 +5205,30 @@ function buildEmailHtml(keyword: string, items: any[]): string {
     const source = item.source || item.organizationName || '不明'
     const procType = item.procedureType || ''
     const url = item.url || ''
+
+    // 締切日表示（募集中のみ通知されているので期限切れはないが、残り日数を色分けして表示）
+    const deadlineStr: string = item.tenderSubmissionDeadline || item.tenderDeadline || ''
+    let deadlineCell = '<span style="color:#9ca3af;font-size:11px;">不明</span>'
+    if (deadlineStr) {
+      const d = new Date(deadlineStr)
+      if (!isNaN(d.getTime())) {
+        const dateLabel = deadlineStr.substring(0, 10)
+        const today = new Date(); today.setHours(0,0,0,0)
+        const diffDays = Math.floor((d.getTime() - today.getTime()) / 86400000)
+        const urgentStyle = diffDays <= 3
+          ? 'color:#dc2626;font-weight:700;'
+          : diffDays <= 7
+            ? 'color:#d97706;font-weight:600;'
+            : 'color:#059669;'
+        const badge = diffDays <= 3
+          ? ` <span style="background:#fee2e2;color:#dc2626;font-size:10px;padding:1px 5px;border-radius:4px;">残り${diffDays}日</span>`
+          : diffDays <= 7
+            ? ` <span style="background:#fef3c7;color:#d97706;font-size:10px;padding:1px 5px;border-radius:4px;">残り${diffDays}日</span>`
+            : ''
+        deadlineCell = `<span style="${urgentStyle}font-size:12px;">${dateLabel}</span>${badge}`
+      }
+    }
+
     return `
       <tr>
         <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;font-size:13px;color:#374151;">${date}</td>
@@ -5212,7 +5236,7 @@ function buildEmailHtml(keyword: string, items: any[]): string {
           <a href="${url}" target="_blank" style="color:#2563eb;text-decoration:none;font-weight:500;">${item.projectName || '（案件名なし）'}</a>
         </td>
         <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;font-size:12px;color:#6b7280;">${source}</td>
-        <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;font-size:12px;color:#6b7280;">${procType}</td>
+        <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;font-size:12px;">${deadlineCell}</td>
       </tr>`
   }).join('')
 
@@ -5229,13 +5253,16 @@ function buildEmailHtml(keyword: string, items: any[]): string {
       <h1 style="margin:0;color:#ffffff;font-size:20px;font-weight:700;">
         🔔 入札DX 新着案件通知
       </h1>
-      <p style="margin:6px 0 0;color:#bfdbfe;font-size:13px;">キーワード「${keyword}」の新着案件が見つかりました</p>
+      <p style="margin:6px 0 0;color:#bfdbfe;font-size:13px;">キーワード「${keyword}」の募集中新着案件が見つかりました</p>
     </div>
 
     <!-- 件数サマリー -->
     <div style="padding:20px 32px;background:#eff6ff;border-bottom:1px solid #dbeafe;">
       <p style="margin:0;font-size:15px;color:#1d4ed8;font-weight:600;">
-        📋 新着 ${items.length} 件 ／ チェック日時: ${now}
+        📋 募集中 新着 ${items.length} 件 ／ チェック日時: ${now}
+      </p>
+      <p style="margin:6px 0 0;font-size:12px;color:#3b82f6;">
+        ✅ 募集終了済みの案件は除外して通知しています
       </p>
     </div>
 
@@ -5247,7 +5274,7 @@ function buildEmailHtml(keyword: string, items: any[]): string {
             <th style="padding:10px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;width:90px;">公告日</th>
             <th style="padding:10px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">案件名</th>
             <th style="padding:10px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;width:120px;">発注機関</th>
-            <th style="padding:10px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;width:100px;">種別</th>
+            <th style="padding:10px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;width:110px;">締切日</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
@@ -5473,7 +5500,22 @@ async function runNotifyCheck(env: {
     errors.push(`防災科研: ${String(e)}`)
   }
 
-  // キーワードフィルタリング & 新着判定（案件名＋説明文＋機関名）
+  // 締切日判定ヘルパー（バックエンド用）
+  // 締切日が取得できてかつ過去の場合のみ false（除外）
+  // 締切日不明の場合は true（通知する）
+  function isStillOpen(item: any): boolean {
+    const deadlineStr: string =
+      item.tenderSubmissionDeadline || item.tenderDeadline || ''
+    if (!deadlineStr) return true // 締切日不明 → 通知する
+    // ISO形式（YYYY-MM-DD or YYYY-MM-DDTHH:mm:ss）を想定
+    const d = new Date(deadlineStr)
+    if (isNaN(d.getTime())) return true // パース失敗 → 通知する
+    const today = new Date()
+    today.setHours(0, 0, 0, 0) // 当日分は「まだ募集中」として扱う
+    return d >= today
+  }
+
+  // キーワードフィルタリング & 締切判定 & 新着判定（案件名＋説明文＋機関名）
   for (const kw of keywords) {
     const matched = allItems.filter(item =>
       (item.projectName || '').includes(kw) ||
@@ -5481,16 +5523,19 @@ async function runNotifyCheck(env: {
       (item.organizationName || '').includes(kw)
     )
 
+    // 募集終了済みを除外
+    const openItems = matched.filter(isStillOpen)
+
     const seenIds = getSeenIds(kw)
-    const freshItems = matched.filter(item => {
+    const freshItems = openItems.filter(item => {
       const id = item.resultId || item.url || item.projectName || ''
       return id && !seenIds.has(id)
     })
 
     newItems[kw] = freshItems
 
-    // 既出IDを更新
-    matched.forEach(item => {
+    // 既出IDを更新（openItemsベースで記録）
+    openItems.forEach(item => {
       const id = item.resultId || item.url || item.projectName || ''
       if (id) seenIds.add(id)
     })
