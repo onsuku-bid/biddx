@@ -5607,6 +5607,8 @@ app.get('/api/notify-status', async (c) => {
     notifyKeywords: keywords ? keywords.split(',').map(s => s.trim()) : [],
     schedule: '毎日 11:00 (JST)',
     lastCheck: '未実施（初回チェック前）',
+    version: 'acc9c94',
+    closedBidFilter: true,
   })
 })
 
