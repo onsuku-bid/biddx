@@ -856,6 +856,15 @@ app.get('/api/search-all', async (c) => {
   const keyword = c.req.query('keyword') || ''
   const sources = (c.req.query('sources') || 'kkj,kyoukaikenpo,pfa,jeed,jfc').split(',')
   const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  const useSynonyms = c.req.query('synonyms') === '1'
+
+  // 類義語展開：KKJ検索用のキーワード展開（OR検索）
+  const expandedKeywords = useSynonyms && keyword
+    ? expandKeywords(keyword)
+    : keyword ? keyword.split(/[,，、]/).map(k => k.trim()).filter(k => k) : []
+
+  // KKJ用クエリ（類義語展開時はOR展開されたキーワードを使う）
+  const kkjQuery = expandedKeywords.length > 0 ? expandedKeywords[0] : (keyword || '入札')
 
   const results: any[] = []
   const errors: Record<string, string> = {}
@@ -864,14 +873,14 @@ app.get('/api/search-all', async (c) => {
     // 官公需API
     sources.includes('kkj') ? (async () => {
       try {
-        const params = new URLSearchParams({ Query: keyword || '入札', Count: '30' })
+        const params = new URLSearchParams({ Query: kkjQuery, Count: '30' })
         const res = await fetch(`http://www.kkj.go.jp/api/?${params.toString()}`, {
           headers: { 'User-Agent': 'BidSearchApp/1.0' }
         })
         const xml = await res.text()
         const parsed = parseKkjXml(xml)
         let items = (parsed.items || []).map((item: any) => ({ ...item, source: '官公需ポータル' }))
-        if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
+        if (keyword) items = filterItemsByKeyword(items, keyword, searchFields, useSynonyms)
         results.push(...items)
       } catch(e) { errors['kkj'] = String(e) }
     })() : Promise.resolve(),
@@ -884,7 +893,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapeKyoukaikenpo(html, 'https://www.kyoukaikenpo.or.jp/disclosure/procurement/')
-        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['kyoukaikenpo'] = String(e) }
     })() : Promise.resolve(),
@@ -897,7 +906,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapePfa(html)
-        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['pfa'] = String(e) }
     })() : Promise.resolve(),
@@ -910,7 +919,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapeJeed(html)
-        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['jeed'] = String(e) }
     })() : Promise.resolve(),
@@ -923,7 +932,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapeJfc(html)
-        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['jfc'] = String(e) }
     })() : Promise.resolve(),
@@ -936,7 +945,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapeFsa(html)
-        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['fsa'] = String(e) }
     })() : Promise.resolve(),
@@ -957,7 +966,7 @@ app.get('/api/search-all', async (c) => {
         }
         const seen = new Set<string>()
         const items = allUitecItems.filter(i => { if (seen.has(i.resultId)) return false; seen.add(i.resultId); return true })
-        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['uitec'] = String(e) }
     })() : Promise.resolve(),
@@ -970,7 +979,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapeOsakaCity(html)
-        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['osaka'] = String(e) }
     })() : Promise.resolve(),
@@ -983,7 +992,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapeHokkaido(html)
-        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['hokkaido'] = String(e) }
     })() : Promise.resolve(),
@@ -996,7 +1005,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapeImabari(html)
-        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['imabari'] = String(e) }
     })() : Promise.resolve(),
@@ -1009,7 +1018,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapeNagano(html)
-        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['nagano'] = String(e) }
     })() : Promise.resolve(),
@@ -1022,7 +1031,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapeIpa(html)
-        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['ipa'] = String(e) }
     })() : Promise.resolve(),
@@ -1035,7 +1044,7 @@ app.get('/api/search-all', async (c) => {
         })
         const html = await res.text()
         const items = scrapeBosai(html)
-        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields) : items
+        const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['bosai'] = String(e) }
     })() : Promise.resolve(),
@@ -1052,6 +1061,7 @@ app.get('/api/search-all', async (c) => {
     totalHits: results.length,
     items: results,
     errors: Object.keys(errors).length > 0 ? errors : undefined,
+    expandedKeywords: useSynonyms && expandedKeywords.length > 1 ? expandedKeywords : undefined,
   })
 })
 
@@ -1145,6 +1155,29 @@ app.get('/api/kkj-org', async (c) => {
 // KKJ機関マスタ一覧取得API
 app.get('/api/kkj-org/list', (c) => {
   return c.json({ orgs: KKJ_ORG_MASTER })
+})
+
+// =============================
+// 類義語API エンドポイント
+// =============================
+
+// 類義語取得API
+app.get('/api/synonyms', (c) => {
+  const keyword = c.req.query('keyword') || ''
+  if (!keyword) {
+    return c.json({ error: 'keyword is required' }, 400)
+  }
+  const synonyms = expandWithSynonyms(keyword)
+  return c.json({
+    original: keyword,
+    synonyms: synonyms.slice(1), // 元のキーワードを除く
+    expanded: synonyms,          // 元のキーワード含む全リスト
+  })
+})
+
+// 類義語辞書キー一覧取得API
+app.get('/api/synonyms/list', (c) => {
+  return c.json({ keywords: Object.keys(SYNONYM_DICT) })
 })
 
 // =============================
@@ -1502,20 +1535,131 @@ function formatDate(date: Date): string {
 }
 
 // =============================
-// 共通キーワードフィルタ（AND検索・検索対象選択対応）
-// searchFields: ['name', 'desc', 'org'] の組み合わせ
-// query: スペース区切りでAND検索
 // =============================
-function filterItemsByKeyword(items: any[], query: string, searchFields: string[]): any[] {
+// 類義語辞書（固定辞書方式）
+// キー: 検索キーワード → 値: 類義語リスト
+// =============================
+const SYNONYM_DICT: Record<string, string[]> = {
+  // 映像・動画関連
+  '動画':           ['映像', 'ビデオ', '動画コンテンツ', '映像コンテンツ'],
+  '動画制作':       ['映像制作', 'ビデオ制作', '動画コンテンツ制作', '映像コンテンツ制作', '動画編集', '映像編集', '動画作成', '映像作成', 'プロモーション映像'],
+  '映像制作':       ['動画制作', 'ビデオ制作', '動画コンテンツ制作', '映像コンテンツ制作', '映像編集', '動画編集'],
+  '映像':           ['動画', 'ビデオ', '映像コンテンツ', '動画コンテンツ'],
+  'プロモーション': ['PR', '広報', '宣伝', 'プロモ', 'キャンペーン'],
+
+  // 研修・教育関連
+  '研修':           ['研修業務', '人材育成', '職員研修', 'トレーニング', 'OJT', '教育訓練', '育成', 'セミナー', '講習'],
+  '教育':           ['研修', '学習', '人材育成', 'トレーニング', '講習', 'eラーニング'],
+  '人材育成':       ['研修', '教育', '職員研修', 'トレーニング', 'OJT', '育成支援'],
+  'セミナー':       ['研修', '講習', '講座', 'ワークショップ', '勉強会', '説明会'],
+  'eラーニング':    ['e-learning', 'オンライン研修', 'オンライン学習', 'WEB研修', 'WBT'],
+
+  // システム・IT関連
+  'システム開発':   ['ソフトウェア開発', 'アプリケーション開発', 'システム構築', 'SE', 'プログラム開発', 'システム整備'],
+  'システム':       ['システム構築', 'システム整備', 'インフラ', 'プラットフォーム'],
+  'ソフトウェア':   ['システム', 'アプリ', 'アプリケーション', 'プログラム'],
+  'WEB':            ['ウェブ', 'ホームページ', 'HP', 'サイト', 'Webサイト', 'ウェブサイト'],
+  'ホームページ':   ['Webサイト', 'ウェブサイト', 'WEB', 'HP', 'サイト構築'],
+  'クラウド':       ['SaaS', 'IaaS', 'PaaS', 'AWS', 'Azure', 'クラウドサービス'],
+  'セキュリティ':   ['情報セキュリティ', 'サイバーセキュリティ', '情報保護', 'セキュリティ対策'],
+  'DX':             ['デジタル化', 'デジタルトランスフォーメーション', 'IT化', 'デジタル変革', 'ICT'],
+  'AI':             ['人工知能', '機械学習', 'ディープラーニング', 'ChatGPT', '生成AI'],
+
+  // 広報・コンテンツ関連
+  '広報':           ['PR', '宣伝', '広告', 'プロモーション', '情報発信', '広報業務'],
+  'パンフレット':   ['リーフレット', '冊子', 'チラシ', 'ブローシャー', '印刷物', '広報誌'],
+  '印刷':           ['印刷物', 'チラシ', 'パンフレット', '冊子', 'リーフレット'],
+  'デザイン':       ['グラフィックデザイン', 'デザイン制作', 'ビジュアルデザイン', 'アートディレクション'],
+  'SNS':            ['ソーシャルメディア', 'Twitter', 'X', 'Facebook', 'Instagram', 'LINE'],
+
+  // コンサルティング・調査関連
+  'コンサルティング': ['コンサル', '支援業務', 'アドバイザリー', '専門家支援', '業務支援'],
+  '調査':           ['調査業務', 'アンケート', 'ヒアリング', '実態調査', 'リサーチ', '市場調査'],
+  'アンケート':     ['調査', 'ヒアリング', '意識調査', 'アンケート調査', 'モニタリング'],
+  '企画':           ['企画業務', '提案', 'プランニング', '立案', '計画策定'],
+
+  // 保守・運用関連
+  '保守':           ['保守管理', '維持管理', 'メンテナンス', '運用保守', '保守点検'],
+  '運用':           ['運用管理', '保守運用', '管理業務', 'オペレーション'],
+  'メンテナンス':   ['保守', '維持管理', '点検', '整備'],
+
+  // イベント・会議関連
+  'イベント':       ['催事', 'フォーラム', 'シンポジウム', '展示会', 'セレモニー', '式典'],
+  'シンポジウム':   ['フォーラム', 'セミナー', '講演会', 'カンファレンス', 'イベント'],
+  '講演':           ['講座', 'セミナー', 'シンポジウム', '講習会', '勉強会'],
+
+  // 建設・施設関連
+  '工事':           ['建設', '建築', '改修', '改築', '新築', '設工事'],
+  '設計':           ['設計業務', '基本設計', '実施設計', '計画設計'],
+  '清掃':           ['清掃業務', '環境整備', 'クリーニング', '清掃管理'],
+  '警備':           ['警備業務', 'セキュリティ', '守衛', '警戒'],
+
+  // 翻訳・通訳関連
+  '翻訳':           ['翻訳業務', '外国語翻訳', '多言語翻訳', '通訳', 'ローカライズ'],
+  '通訳':           ['翻訳', '同時通訳', '逐次通訳', '言語サービス'],
+}
+
+// キーワードの類義語を展開する関数
+function expandWithSynonyms(keyword: string): string[] {
+  const normalized = keyword.trim()
+  if (!normalized) return []
+
+  const synonyms = SYNONYM_DICT[normalized] || []
+  // 元のキーワード + 類義語（重複なし）
+  return [normalized, ...synonyms.filter(s => s !== normalized)]
+}
+
+// 複数キーワード（カンマ区切り）を類義語展開する
+function expandKeywords(query: string): string[] {
+  const parts = query.split(/[,，、]/).map(k => k.trim()).filter(k => k.length > 0)
+  const expanded: string[] = []
+  for (const part of parts) {
+    for (const kw of expandWithSynonyms(part)) {
+      if (!expanded.includes(kw)) expanded.push(kw)
+    }
+  }
+  return expanded
+}
+
+// =============================
+// 共通キーワードフィルタ（AND検索・OR検索・類義語展開対応）
+// searchFields: ['name', 'desc', 'org'] の組み合わせ
+// query: スペース区切りでAND検索、カンマ区切りでOR検索
+// useSynonyms: trueの場合、類義語辞書で展開してOR検索
+// =============================
+function filterItemsByKeyword(items: any[], query: string, searchFields: string[], useSynonyms = false): any[] {
   if (!query) return items
-  const keywords = query.toLowerCase().split(/[\s　]+/).filter(k => k.length > 0)
-  return items.filter(item => {
+
+  // 検索対象テキストを取得するヘルパー
+  const getTargetText = (item: any): string => {
     const targets: string[] = []
     if (searchFields.includes('name')) targets.push((item.projectName || '').toLowerCase())
     if (searchFields.includes('desc')) targets.push((item.projectDescription || '').toLowerCase())
     if (searchFields.includes('org')) targets.push((item.organizationName || '').toLowerCase())
-    const combined = targets.join(' ')
-    return keywords.every(kw => combined.includes(kw))
+    return targets.join(' ')
+  }
+
+  // カンマ区切り → OR検索グループ、スペース区切り → AND検索
+  const orGroups = query.split(/[,，、]/).map(k => k.trim()).filter(k => k.length > 0)
+
+  return items.filter(item => {
+    const combined = getTargetText(item)
+
+    // いずれかのORグループにマッチすればOK
+    return orGroups.some(group => {
+      // スペース区切りのANDキーワード
+      const andKeywords = group.toLowerCase().split(/[\s　]+/).filter(k => k.length > 0)
+
+      // 類義語展開ONの場合: 各ANDキーワードの類義語をOR展開
+      if (useSynonyms) {
+        return andKeywords.every(kw => {
+          const kwExpanded = expandWithSynonyms(kw).map(s => s.toLowerCase())
+          return kwExpanded.some(syn => combined.includes(syn))
+        })
+      } else {
+        return andKeywords.every(kw => combined.includes(kw))
+      }
+    })
   })
 }
 
@@ -2921,7 +3065,7 @@ function renderHTML(): string {
             </div>
           </div>
         </div>
-        <!-- 検索対象・AND検索オプション -->
+        <!-- 検索対象・AND検索・類義語オプション -->
         <div class="bg-gray-50 rounded-xl px-4 py-3 mb-4 flex flex-wrap items-center gap-4">
           <div class="flex items-center gap-1 text-xs font-medium text-gray-600">
             <i class="fas fa-sliders-h text-indigo-500 mr-1"></i>検索対象：
@@ -2939,6 +3083,15 @@ function renderHTML(): string {
           <div class="border-l border-gray-300 pl-4 flex items-center gap-1.5 text-xs text-gray-500">
             <i class="fas fa-info-circle text-indigo-400"></i>
             スペース区切りで<strong class="text-gray-700">AND検索</strong>
+          </div>
+          <div class="border-l border-gray-300 pl-4 flex items-center gap-2">
+            <label class="flex items-center gap-1.5 text-xs cursor-pointer select-none group" title="入力キーワードを類義語に展開してOR検索します（例: 動画制作 → 映像制作, ビデオ制作 など）">
+              <input type="checkbox" id="all-use-synonyms" class="accent-purple-500">
+              <span class="text-purple-700 font-medium group-hover:text-purple-900 transition-colors">
+                <i class="fas fa-magic mr-0.5 text-purple-400"></i>類義語展開
+              </span>
+            </label>
+            <span id="all-synonym-hint" class="hidden text-xs text-purple-500 italic"></span>
           </div>
         </div>
         <button onclick="loadAll()"
@@ -4602,8 +4755,15 @@ async function loadAll() {
     const allSfOrg  = document.getElementById('all-sf-org')?.checked;
     const searchFields = [allSfName && 'name', allSfDesc && 'desc', allSfOrg && 'org'].filter(Boolean).join(',') || 'name';
 
+    const useSynonyms = document.getElementById('all-use-synonyms')?.checked || false;
+
     const params = { sources: sources.join(','), searchFields };
     if (query) params.keyword = query;
+    if (useSynonyms) params.synonyms = '1';
+
+    // 類義語ヒント表示をリセット
+    const synonymHint = document.getElementById('all-synonym-hint');
+    if (synonymHint) { synonymHint.textContent = ''; synonymHint.classList.add('hidden'); }
 
     const res = await axios.get('/api/search-all', { params });
     const data = res.data;
@@ -4631,7 +4791,19 @@ async function loadAll() {
       '企業年金連合会': 'bg-amber-50 text-amber-700 border-amber-200',
     };
 
+    // 類義語展開ヒントを表示
+    if (data.expandedKeywords && data.expandedKeywords.length > 0 && synonymHint) {
+      synonymHint.textContent = '展開: ' + data.expandedKeywords.join(', ');
+      synonymHint.classList.remove('hidden');
+    }
+
     let summaryHtml = '<div class="flex flex-wrap gap-2 mb-4">';
+    // 類義語展開バッジ
+    if (data.expandedKeywords && data.expandedKeywords.length > 0) {
+      summaryHtml += \`<span class="tag border border-purple-200 bg-purple-50 text-purple-700 px-3 py-1 text-xs">
+        <i class="fas fa-magic mr-1"></i>類義語展開: \${escHtml(data.expandedKeywords.slice(0,5).join(' / '))}\${data.expandedKeywords.length > 5 ? ' …' : ''}
+      </span>\`;
+    }
     for (const [src, cnt] of Object.entries(sourceCounts)) {
       const colorCls = Object.entries(sourceColors).find(([k]) => src.includes(k.split(' ')[0]))?.[1] || 'bg-gray-50 text-gray-700 border-gray-200';
       summaryHtml += \`<span class="tag border \${colorCls} px-3 py-1 text-xs">\${escHtml(src)}: \${cnt}件</span>\`;
