@@ -5502,20 +5502,105 @@ async function runNotifyCheck(env: {
 
   // 締切日判定ヘルパー（バックエンド用）
   // 締切日が取得できてかつ過去の場合のみ false（除外）
-  // 締切日不明の場合は true（通知する）
+  // 締切日不明の場合はフォールバックロジックで判定
+
+  /**
+   * projectDescription テキストから締切日を抽出する
+   * 対応パターン例：
+   *   「令和8年（2026年）5月21日」「2026年6月9日（火）12時」
+   *   「令和8年5月21日」「R8.5.21」
+   */
+  function extractDeadlineFromDescription(desc: string): Date | null {
+    if (!desc) return null
+
+    // ① 西暦年パターン: 2026年5月21日 / 2026/5/21 / 2026-05-21
+    const westernPatterns = [
+      // 2026年5月21日（曜日）HH時 or 2026年5月21日
+      /(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日/g,
+      // 2026/5/21 or 2026-05-21
+      /(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/g,
+    ]
+
+    // ② 和暦パターン: 令和8年5月21日 / 令和8年（2026年）5月21日
+    const wareki: Record<string, number> = {
+      '令和': 2018, '平成': 1988, '昭和': 1925, '大正': 1911, '明治': 1868,
+    }
+    const warekiPattern = /(令和|平成|昭和|大正|明治)\s*(\d{1,2})\s*年(?:[（(]\d{4}年[）)])?\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/g
+
+    const candidates: Date[] = []
+
+    // 西暦パターンで抽出
+    for (const re of westernPatterns) {
+      re.lastIndex = 0
+      let m: RegExpExecArray | null
+      while ((m = re.exec(desc)) !== null) {
+        const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+        if (!isNaN(d.getTime())) candidates.push(d)
+      }
+    }
+
+    // 和暦パターンで抽出
+    warekiPattern.lastIndex = 0
+    let wm: RegExpExecArray | null
+    while ((wm = warekiPattern.exec(desc)) !== null) {
+      const base = wareki[wm[1]] ?? 2018
+      const year = base + Number(wm[2])
+      const d = new Date(year, Number(wm[3]) - 1, Number(wm[4]))
+      if (!isNaN(d.getTime())) candidates.push(d)
+    }
+
+    if (candidates.length === 0) return null
+
+    // 複数候補がある場合は最も未来に近い日付を締切日とみなす
+    // ただし今から2年以上先は除外（誤認識対策）
+    const twoYearsLater = new Date()
+    twoYearsLater.setFullYear(twoYearsLater.getFullYear() + 2)
+    const valid = candidates.filter(d => d <= twoYearsLater)
+    if (valid.length === 0) return null
+
+    // 最大値（最も遠い締切）を返す
+    return valid.reduce((a, b) => (a > b ? a : b))
+  }
+
   function isStillOpen(item: any): boolean {
-    const deadlineStr: string =
-      item.tenderSubmissionDeadline || item.tenderDeadline || ''
-    if (!deadlineStr) return true // 締切日不明 → 通知する
-    // ISO形式（YYYY-MM-DD or YYYY-MM-DDTHH:mm:ss）を想定
-    const d = new Date(deadlineStr)
-    if (isNaN(d.getTime())) return true // パース失敗 → 通知する
     const today = new Date()
     today.setHours(0, 0, 0, 0) // 当日分は「まだ募集中」として扱う
-    return d >= today
+
+    // ── Step 1: tenderSubmissionDeadline / tenderDeadline（ISO形式）──
+    const deadlineStr: string =
+      item.tenderSubmissionDeadline || item.tenderDeadline || ''
+    if (deadlineStr) {
+      const d = new Date(deadlineStr)
+      if (!isNaN(d.getTime())) {
+        return d >= today
+      }
+    }
+
+    // ── Step 2: projectDescription から日本語テキスト抽出 ──
+    const descDeadline = extractDeadlineFromDescription(item.projectDescription || '')
+    if (descDeadline !== null) {
+      return descDeadline >= today
+    }
+
+    // ── Step 3: 公告日（cftIssueDate / date）から60日経過で除外 ──
+    const issueDateStr: string = item.cftIssueDate || item.date || ''
+    if (issueDateStr) {
+      const issueDate = new Date(issueDateStr)
+      if (!isNaN(issueDate.getTime())) {
+        const daysSinceIssue = Math.floor(
+          (today.getTime() - issueDate.getTime()) / 86400000
+        )
+        if (daysSinceIssue > 60) return false // 公告から60日超過 → 募集終了扱い
+      }
+    }
+
+    // ── Step 4: 判定不能 → 安全側で通知する ──
+    return true
   }
 
   // キーワードフィルタリング & 締切判定 & 新着判定（案件名＋説明文＋機関名）
+  const filterStats: Record<string, { matched: number; open: number; fresh: number }> = {}
+
   for (const kw of keywords) {
     const matched = allItems.filter(item =>
       (item.projectName || '').includes(kw) ||
@@ -5532,6 +5617,7 @@ async function runNotifyCheck(env: {
       return id && !seenIds.has(id)
     })
 
+    filterStats[kw] = { matched: matched.length, open: openItems.length, fresh: freshItems.length }
     newItems[kw] = freshItems
 
     // 既出IDを更新（openItemsベースで記録）
@@ -5557,7 +5643,7 @@ async function runNotifyCheck(env: {
     }
   }
 
-  return { checked: totalChecked, newItems, sent, errors }
+  return { checked: totalChecked, newItems, sent, errors, filterStats }
 }
 
 // ===========================
@@ -5586,6 +5672,7 @@ app.get('/api/notify-check', async (c) => {
     status: 'ok',
     checkedTotal: result.checked,
     newItems: summary,
+    filterStats: result.filterStats,  // matched→open→fresh の件数推移
     mailSent: result.sent,
     errors: result.errors.length > 0 ? result.errors : undefined,
     timestamp: new Date().toISOString(),
