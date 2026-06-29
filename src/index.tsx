@@ -1082,6 +1082,95 @@ app.get('/api/search-all', async (c) => {
 })
 
 // =============================
+// 「動画制作」特化 ワンクリック検索API
+//  - 動画関連の広いキーワードでKKJをOR取得して取りこぼし防止
+//  - scoreVideoItem でノイズ（映像システム/機器/工事等）を除外＆関連度順
+//  - priceOnly=1（既定ON）で価格競争（一般競争・オープンカウンター等）を優先
+//  - sources で他ソース（自治体スクレイピング）も横断可能
+// =============================
+app.get('/api/search-video', async (c) => {
+  // 追加の絞り込みキーワード（任意。例: "観光" で観光×動画に絞る）
+  const extra = (c.req.query('keyword') || '').trim()
+  // 価格競争のみ優先（既定ON）。'0'指定で全手続を対象
+  const priceOnly = c.req.query('priceOnly') !== '0'
+  // 横断ソース（既定はKKJのみ。動画案件の大半はKKJ経由）
+  const sources = (c.req.query('sources') || 'kkj').split(',')
+  // 関連度の最低スコア（既定40＝動画制作の確度が高い案件のみ）。
+  //  loose=1 で 1 まで下げ、説明文に動画語を含む弱い候補も拾う
+  const minScore = c.req.query('loose') === '1' ? 1 : parseInt(c.req.query('minScore') || '40')
+
+  const collected: any[] = []
+  const errors: Record<string, string> = {}
+  const seen = new Set<string>()
+
+  await Promise.allSettled([
+    // --- KKJ: 動画関連キーワードでOR取得 ---
+    sources.includes('kkj') ? (async () => {
+      // KKJへの負荷とレート制限を避けるため逐次取得（並列にしない）
+      for (const q of VIDEO_FETCH_KEYWORDS) {
+        try {
+          const params = new URLSearchParams({ Query: q, Count: '50' })
+          const res = await fetch(`http://www.kkj.go.jp/api/?${params.toString()}`, {
+            headers: { 'User-Agent': 'BidSearchApp/1.0' },
+            signal: AbortSignal.timeout(15000),
+          })
+          const parsed = parseKkjXml(await res.text())
+          for (const item of (parsed.items || [])) {
+            const dedupKey = item.resultId || item.url || item.projectName
+            if (dedupKey && seen.has(dedupKey)) continue
+            if (dedupKey) seen.add(dedupKey)
+            collected.push({ ...item, source: '官公需ポータル' })
+          }
+        } catch (e) {
+          errors['kkj_' + q] = String(e)
+        }
+      }
+    })() : Promise.resolve(),
+  ])
+
+  // --- 動画スコアリング＆除外 ---
+  let scored = collected
+    .map(item => ({ item, ...scoreVideoItem(item) }))
+    .filter(x => x.isVideo && x.score >= minScore)
+
+  // 追加キーワードがあればAND絞り込み（タイトル/本文/機関名を正規化して部分一致）
+  if (extra) {
+    const extraKws = extra.split(/[\s　]+/).map(k => normalizeText(k)).filter(k => k)
+    scored = scored.filter(x => {
+      const t = normalizeText(x.item.projectName || '') + ' ' +
+                normalizeText(x.item.projectDescription || '') + ' ' +
+                normalizeText(x.item.organizationName || '')
+      return extraKws.every(kw => t.includes(kw))
+    })
+  }
+
+  // 価格競争のみ優先：プロポ・企画競争で減点された案件を除外
+  if (priceOnly) {
+    scored = scored.filter(x => {
+      const t = normalizeText(x.item.projectName || '') + ' ' +
+                normalizeText(x.item.procedureType || '')
+      return !VIDEO_PROPOSAL_TERMS_NORM.some(p => t.includes(p))
+    })
+  }
+
+  // 並び替え：関連度スコア降順 → 同点は公告日の新しい順
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score
+    return toSortKey(b.item.cftIssueDate) - toSortKey(a.item.cftIssueDate)
+  })
+
+  const items = scored.map(x => ({ ...x.item, _videoScore: x.score }))
+
+  return c.json({
+    profile: '動画制作',
+    priceOnly,
+    totalHits: items.length,
+    items,
+    errors: Object.keys(errors).length > 0 ? errors : undefined,
+  })
+})
+
+// =============================
 // KKJ 機関名フィルタ API
 // 機関名でKKJを絞り込み取得するエンドポイント
 // =============================
@@ -1652,6 +1741,94 @@ const SYNONYM_DICT: Record<string, string[]> = {
   '通訳':           ['翻訳', '同時通訳', '逐次通訳', '言語サービス'],
 }
 
+// =============================
+// 「動画制作」特化検索プロファイル
+//  - 用途の大半が動画制作のため、取りこぼし防止＋ノイズ除去＋関連度順を最適化
+//  - 省庁統一資格C／価格競争（一般競争入札・オープンカウンター等）を優先
+// =============================
+
+// (1) KKJに投げる取得用キーワード
+//  ※KKJ APIは1キーワードでも非常に広く返す（関連度を見ない）うえ応答が数MB級と大きい。
+//   並列大量取得はKKJ側のレート制限・遅延を招くため、代表語を少数・逐次取得し、
+//   精度は scoreVideoItem 側で担保する設計にする。
+const VIDEO_FETCH_KEYWORDS = [
+  '動画', '映像',
+]
+
+// (2) 「動画制作」案件と判定する強い語（いずれか含めば動画案件の可能性大）
+const VIDEO_CORE_TERMS = [
+  '動画', '映像', 'ビデオ', 'ムービー', 'プロモーションびでお', // ※normalize後はカナ→ひらがな
+]
+// normalize前提で持つ（normalizeTextでカタカナ→ひらがな・全角半角・小文字化されるため）
+const VIDEO_CORE_TERMS_NORM = [
+  '動画', '映像', 'びでお', 'むーびー', 'もーしょん', 'pv', 'cm',
+]
+
+// (3) 制作系の語（動画＋これが揃うと「動画制作」確度が高い → 加点）
+//  ※「配信」は「映像配信システム」等のハード系と紛らわしいため制作系には含めない
+const VIDEO_PRODUCTION_TERMS_NORM = [
+  '制作', '製作', '作成', '編集', '撮影', 'コンテンツ', '広報', 'pr', 'プロモーション', '番組',
+]
+
+// (4) ノイズ語：「映像」等を含むが動画制作ではない案件（含めば大きく減点／除外）
+//  例: 映像配信システム / 監視カメラ / 映像装置 / 録画機器 / プロジェクター 等
+const VIDEO_NOISE_TERMS_NORM = [
+  'システム', '配信システム', '装置', '機器', '設備', 'カメラ', '監視', 'モニター', 'ディスプレイ',
+  'プロジェクター', 'スクリーン', '録画', '蓄積', 'サーバ', 'ストレージ', '回線',
+  'ケーブル', '配線', '工事', '修繕', '改修', '改築', '新築', '解体', '撤去',
+  '賃貸借', 'リース', '保守', '点検', '購入', '製造', '据付', '取替',
+]
+
+// (5) 価格競争（省庁統一資格Cで戦える）手続を示す語 → 加点
+const VIDEO_PRICE_COMP_TERMS_NORM = [
+  '一般競争', 'オープンカウンター', '見積', '希望制', '少額', '制限付', '指名競争',
+]
+// (6) 価格以外で評価される手続（プロポ・企画競争）を示す語 → 減点（除外はしない）
+const VIDEO_PROPOSAL_TERMS_NORM = [
+  'プロポーザル', '公募型', '企画競争', 'コンペ', '提案competition',
+]
+
+// 動画案件の関連度スコアを算出（高いほど「動画制作×価格競争」に近い）
+//  戻り値: { score, isVideo } score<0 や isVideo=false は結果から除外
+function scoreVideoItem(item: any): { score: number; isVideo: boolean } {
+  const name = normalizeText(item.projectName || '')
+  const desc = normalizeText(item.projectDescription || '')
+  const proc = normalizeText(item.procedureType || '')
+  const text = name + ' ' + desc + ' ' + proc
+
+  // --- 動画案件かどうか（コア語がタイトル/本文に含まれるか）---
+  const hasCore = VIDEO_CORE_TERMS_NORM.some(t => text.includes(t))
+  if (!hasCore) return { score: 0, isVideo: false }
+
+  let score = 0
+
+  // コア語の位置：タイトルにあれば強い
+  if (VIDEO_CORE_TERMS_NORM.some(t => name.includes(t))) score += 30
+  else score += 10 // 本文のみ
+
+  // 制作系の語が揃う → 「動画制作」確度UP
+  const prodHits = VIDEO_PRODUCTION_TERMS_NORM.filter(t => text.includes(t)).length
+  score += Math.min(prodHits, 3) * 12 // 最大+36
+
+  // ノイズ語（映像配信システム等のハード/工事系）→ 減点。多ければ動画案件でないと判断
+  const noiseHits = VIDEO_NOISE_TERMS_NORM.filter(t => text.includes(t)).length
+  score -= noiseHits * 25
+
+  // 価格競争手続（一般競争・オープンカウンター等）→ 加点（省庁統一資格Cで戦える）
+  if (VIDEO_PRICE_COMP_TERMS_NORM.some(t => text.includes(t))) score += 25
+  // プロポ・企画競争（価格以外で評価）→ 減点
+  if (VIDEO_PROPOSAL_TERMS_NORM.some(t => text.includes(t))) score -= 30
+
+  // 役務カテゴリは動画制作の主戦場 → 軽く加点（工事/物品は下げる）
+  const cat = item.category || ''
+  if (cat.includes('役務')) score += 8
+  else if (cat.includes('工事')) score -= 15
+
+  // ノイズ語が強く効いて動画案件でないと判断できる場合は除外
+  if (score <= 0) return { score, isVideo: false }
+  return { score, isVideo: true }
+}
+
 // キーワードの類義語を展開する関数
 function expandWithSynonyms(keyword: string): string[] {
   const normalized = keyword.trim()
@@ -2081,6 +2258,9 @@ function renderHTML(): string {
     </a>
     <div class="border-t border-white/20 my-2"></div>
     <p class="text-xs text-blue-300 px-4 py-1 font-medium uppercase tracking-wider">一括検索</p>
+    <a href="#" onclick="showPage('video')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm font-semibold bg-gradient-to-r from-pink-500/20 to-purple-500/20 ring-1 ring-pink-300/30" id="nav-video">
+      <i class="fas fa-film w-4 text-pink-300"></i> 動画制作をさがす
+    </a>
     <a href="#" onclick="showPage('all')" class="sidebar-link flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm" id="nav-all">
       <i class="fas fa-layer-group w-4"></i> 全ソース一括検索
     </a>
@@ -3067,6 +3247,47 @@ function renderHTML(): string {
     </div>
 
     <!-- 全ソース一括検索ページ -->
+    <!-- 動画制作 ワンクリック検索ページ -->
+    <div id="page-video" class="page-content hidden">
+      <div class="bg-gradient-to-br from-pink-50 to-purple-50 border border-pink-100 rounded-2xl p-6 mb-5">
+        <div class="flex items-start gap-4">
+          <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-pink-500 to-purple-600 flex items-center justify-center text-white text-xl shadow-md flex-shrink-0">
+            <i class="fas fa-film"></i>
+          </div>
+          <div class="flex-1">
+            <h3 class="font-bold text-gray-800 text-lg">動画制作の案件をさがす</h3>
+            <p class="text-sm text-gray-600 mt-1">
+              動画・映像・PR動画・撮影・編集などの案件を、関連度の高い順に表示します。
+              映像配信システムや監視カメラ等のノイズは自動で除外します。
+            </p>
+            <div class="flex flex-wrap items-center gap-4 mt-4">
+              <button onclick="loadVideo()" id="video-search-btn"
+                class="text-white px-8 py-3 rounded-xl font-bold text-sm shadow-md flex items-center gap-2 bg-gradient-to-r from-pink-500 to-purple-600 hover:from-pink-600 hover:to-purple-700 transition-all">
+                <i class="fas fa-search"></i> 動画制作の案件を検索
+              </button>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none" title="一般競争入札・オープンカウンターなど価格で勝負できる案件に絞ります（プロポーザル・企画競争を除外）">
+                <input type="checkbox" id="video-price-only" checked class="accent-purple-600 w-4 h-4">
+                <span class="font-medium">価格競争の案件に絞る</span>
+                <span class="text-xs text-gray-400">（一般競争・オープンカウンター等／プロポ除外）</span>
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none" title="説明文に動画・映像が含まれる弱い候補も表示します（精度より網羅性を優先）">
+                <input type="checkbox" id="video-loose" class="accent-pink-500 w-4 h-4">
+                <span class="font-medium">広めに表示</span>
+                <span class="text-xs text-gray-400">（取りこぼし防止・ノイズ増）</span>
+              </label>
+            </div>
+            <div class="mt-3 flex items-center gap-2">
+              <i class="fas fa-filter text-pink-400 text-xs"></i>
+              <input id="video-extra" type="text" placeholder="さらに絞り込む（任意・例: 観光 / ふるさと納税）"
+                class="flex-1 max-w-md px-3 py-2 border border-pink-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-pink-300"
+                onkeypress="if(event.key==='Enter') loadVideo()">
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="video-result-area"></div>
+    </div>
+
     <div id="page-all" class="page-content hidden">
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
           <div class="md:col-span-2">
@@ -3408,6 +3629,7 @@ function showPage(page) {
     ipa: 'IPA 情報処理推進機構 調達情報',
     bosai: '防災科学技術研究所 調達情報',
     all: '全ソース一括検索',
+    video: '動画制作の案件をさがす',
     bookmark: 'ブックマーク',
     notify: 'メール通知設定',
     mod: '防衛省（内局）調達情報',
@@ -3434,6 +3656,7 @@ function showPage(page) {
     ipa: '独立行政法人情報処理推進機構 公式サイトから直接取得',
     bosai: '国立研究開発法人防災科学技術研究所 公式サイトから直接取得',
     all: '官公需ポータル・協会けんぽ・企業年金連合会・JEED・JFC・IPA・防災科研・大阪市・北海道・今治市・長野県 横断検索',
+    video: '官公需ポータルから動画・映像制作案件を関連度順に抽出（ノイズ自動除去・価格競争優先）',
     bookmark: 'ブラウザのlocalStorageに保存（このPCのみ）',
     notify: 'キーワード一致の新着案件をメールで自動通知',
     mod: '防衛省大臣官房会計課 公式サイトから直接取得',
@@ -3447,6 +3670,13 @@ function showPage(page) {
   // ページ固有の初期化
   if (page === 'dashboard') {
     loadDashboard();
+  } else if (page === 'video') {
+    // 初回表示時のみ自動検索（KKJへの過剰リクエストを避けるため2回目以降は手動）
+    const va = document.getElementById('video-result-area');
+    if (va && !va.dataset.loaded) {
+      va.dataset.loaded = '1';
+      loadVideo();
+    }
   } else if (page === 'new') {
     loadCategoryPage('new', null, '新着案件');
   } else if (page === 'construction') {
@@ -4775,6 +5005,70 @@ async function loadModDih() {
 // ========================
 // 全ソース一括検索
 // ========================
+async function loadVideo() {
+  const area = document.getElementById('video-result-area');
+  const priceOnly = document.getElementById('video-price-only')?.checked;
+  const loose = document.getElementById('video-loose')?.checked;
+  const extra = document.getElementById('video-extra')?.value.trim() || '';
+
+  area.innerHTML = \`<div class="flex justify-center py-16"><div class="text-center"><div class="loading-spinner mx-auto mb-4"></div><p class="text-gray-500 text-sm">動画制作の案件を検索中...</p></div></div>\`;
+
+  try {
+    const params = {};
+    if (!priceOnly) params.priceOnly = '0';
+    if (loose) params.loose = '1';
+    if (extra) params.keyword = extra;
+
+    const res = await axios.get('/api/search-video', { params });
+    const data = res.data;
+
+    if (!data.items || data.items.length === 0) {
+      area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+        <i class="fas fa-film text-gray-300 text-4xl mb-4"></i>
+        <p class="text-gray-500 text-lg">該当する動画制作の案件が見つかりませんでした</p>
+        <p class="text-xs text-gray-400 mt-2">「価格競争の案件に絞る」を外すと、プロポーザル案件も表示されます</p>
+      </div>\`;
+      return;
+    }
+
+    let badges = '<div class="flex flex-wrap gap-2 mb-4">';
+    badges += \`<span class="tag border border-pink-200 bg-pink-50 text-pink-700 px-3 py-1 text-xs"><i class="fas fa-film mr-1"></i>動画制作: \${data.totalHits}件</span>\`;
+    if (data.priceOnly) {
+      badges += \`<span class="tag border border-purple-200 bg-purple-50 text-purple-700 px-3 py-1 text-xs"><i class="fas fa-yen-sign mr-1"></i>価格競争のみ（プロポ除外）</span>\`;
+    }
+    if (extra) {
+      badges += \`<span class="tag border border-gray-200 bg-gray-50 text-gray-700 px-3 py-1 text-xs"><i class="fas fa-filter mr-1"></i>絞り込み: \${escHtml(extra)}</span>\`;
+    }
+    badges += '</div>';
+
+    let html = \`
+      <div class="bg-white rounded-2xl shadow-sm border border-gray-100">
+        <div class="p-5 border-b border-gray-100">
+          <h3 class="font-bold text-gray-800 flex items-center gap-2 mb-3">
+            <i class="fas fa-film text-pink-500"></i>
+            動画制作の案件
+            <span class="ml-2 text-xs bg-pink-50 text-pink-600 px-2 py-0.5 rounded-full font-normal">関連度の高い順</span>
+          </h3>
+          \${badges}
+          \${data.errors ? \`<div class="text-xs text-orange-600 bg-orange-50 border border-orange-200 rounded-lg px-3 py-2">
+            <i class="fas fa-exclamation-circle mr-1"></i>官公需ポータルの取得で一部エラーが発生しました（取得できたデータのみ表示）
+          </div>\` : ''}
+        </div>
+        <div id="result-list" class="divide-y divide-gray-50">
+    \`;
+    data.items.forEach(item => { html += renderAllItem(item); });
+    html += \`</div></div>\`;
+    area.innerHTML = html;
+    searchResults = data.items;
+  } catch(e) {
+    area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+      <i class="fas fa-exclamation-triangle text-yellow-500 text-3xl mb-3"></i>
+      <p class="text-gray-600">動画制作の検索に失敗しました</p>
+      <p class="text-xs text-gray-400 mt-1">\${e.message}</p>
+    </div>\`;
+  }
+}
+
 async function loadAll() {
   const area = document.getElementById('all-result-area');
   const query = document.getElementById('all-query').value.trim();
