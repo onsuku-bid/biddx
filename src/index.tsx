@@ -863,24 +863,44 @@ app.get('/api/search-all', async (c) => {
     ? expandKeywords(keyword)
     : keyword ? keyword.split(/[,，、]/).map(k => k.trim()).filter(k => k) : []
 
-  // KKJ用クエリ（類義語展開時はOR展開されたキーワードを使う）
-  const kkjQuery = expandedKeywords.length > 0 ? expandedKeywords[0] : (keyword || '入札')
+  // KKJ用クエリ群（取りこぼし防止のため全キーワード／類義語展開語で個別取得してマージ）
+  //  - キーワード未指定時は '入札' で広く取得
+  const kkjQueries = expandedKeywords.length > 0 ? expandedKeywords : ['入札']
+  // 1クエリあたりの取得件数（従来30→100に拡大して取りこぼしを削減）
+  const KKJ_COUNT_PER_QUERY = '100'
 
   const results: any[] = []
   const errors: Record<string, string> = {}
 
   await Promise.allSettled([
-    // 官公需API
+    // 官公需API（複数キーワードを個別取得→resultIdで重複除去→共通フィルタ）
     sources.includes('kkj') ? (async () => {
       try {
-        const params = new URLSearchParams({ Query: kkjQuery, Count: '30' })
-        const res = await fetch(`http://www.kkj.go.jp/api/?${params.toString()}`, {
-          headers: { 'User-Agent': 'BidSearchApp/1.0' }
-        })
-        const xml = await res.text()
-        const parsed = parseKkjXml(xml)
-        let items = (parsed.items || []).map((item: any) => ({ ...item, source: '官公需ポータル' }))
-        if (keyword) items = filterItemsByKeyword(items, keyword, searchFields, useSynonyms)
+        const merged: any[] = []
+        const seen = new Set<string>()
+        // 各キーワードを並列取得（KKJ側の取りこぼしを防ぐ）
+        const kkjResults = await Promise.allSettled(
+          kkjQueries.map(async (q) => {
+            const params = new URLSearchParams({ Query: q, Count: KKJ_COUNT_PER_QUERY })
+            const res = await fetch(`http://www.kkj.go.jp/api/?${params.toString()}`, {
+              headers: { 'User-Agent': 'BidSearchApp/1.0' }
+            })
+            const xml = await res.text()
+            return parseKkjXml(xml)
+          })
+        )
+        for (const r of kkjResults) {
+          if (r.status !== 'fulfilled') continue
+          for (const item of (r.value.items || [])) {
+            // resultId（無ければurl）で重複排除
+            const dedupKey = item.resultId || item.url || item.projectName
+            if (dedupKey && seen.has(dedupKey)) continue
+            if (dedupKey) seen.add(dedupKey)
+            merged.push({ ...item, source: '官公需ポータル' })
+          }
+        }
+        // クライアント側で最終フィルタ（正規化込み・AND/OR/類義語対応）
+        let items = keyword ? filterItemsByKeyword(merged, keyword, searchFields, useSynonyms) : merged
         results.push(...items)
       } catch(e) { errors['kkj'] = String(e) }
     })() : Promise.resolve(),
@@ -1050,12 +1070,8 @@ app.get('/api/search-all', async (c) => {
     })() : Promise.resolve(),
   ])
 
-  // 公告日降順でソート
-  results.sort((a, b) => {
-    const da = a.cftIssueDate || ''
-    const db = b.cftIssueDate || ''
-    return db.localeCompare(da)
-  })
+  // 公告日降順でソート（形式混在を吸収し、日付不明は末尾へ）
+  results.sort((a, b) => toSortKey(b.cftIssueDate) - toSortKey(a.cftIssueDate))
 
   return c.json({
     totalHits: results.length,
@@ -1250,15 +1266,15 @@ app.get('/api/search', async (c) => {
     if (query && parsed.items) {
       // 検索対象フィールド（カンマ区切り: name, desc, org）
       const searchFields = (c.req.query('searchFields') || 'name').split(',')
-      // スペース区切りでAND検索（全角・半角スペース対応）
-      const keywords = query.toLowerCase().split(/[\s　]+/).filter(k => k.length > 0)
+      // スペース区切りでAND検索（共通正規化を適用：全角半角/大小文字/カナ/長音）
+      const keywords = query.split(/[\s　]+/).map(k => normalizeText(k)).filter(k => k.length > 0)
 
       parsed.items = (parsed.items as any[]).filter((item: any) => {
-        // 検索対象テキストを結合
+        // 検索対象テキストを結合（正規化）
         const targets: string[] = []
-        if (searchFields.includes('name')) targets.push((item.projectName || '').toLowerCase())
-        if (searchFields.includes('desc')) targets.push((item.projectDescription || '').toLowerCase())
-        if (searchFields.includes('org')) targets.push((item.organizationName || '').toLowerCase())
+        if (searchFields.includes('name')) targets.push(normalizeText(item.projectName || ''))
+        if (searchFields.includes('desc')) targets.push(normalizeText(item.projectDescription || ''))
+        if (searchFields.includes('org')) targets.push(normalizeText(item.organizationName || ''))
         const combined = targets.join(' ')
         // 全キーワードが含まれていればAND一致
         return keywords.every(kw => combined.includes(kw))
@@ -1406,6 +1422,43 @@ function wareki2iso(wareki: string): string {
     return `${year}-${month}-${day}T00:00:00+09:00`
   }
   return wareki
+}
+
+// =============================
+// 共通テキスト正規化（検索精度向上のため）
+//  - 全角英数字 → 半角
+//  - 大文字 → 小文字
+//  - 全角スペース → 半角スペース
+//  - カタカナ → ひらがな（カナ表記ゆれ吸収）
+//  - 長音「ー」「－」「‐」などを統一
+// =============================
+function normalizeText(text: string): string {
+  if (!text) return ''
+  return text
+    // 全角英数字・記号 → 半角
+    .replace(/[\uFF01-\uFF5E]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
+    // 全角スペース → 半角スペース
+    .replace(/\u3000/g, ' ')
+    // 各種ハイフン/長音類を長音「ー」に統一
+    .replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uFF0D\u30FC]/g, 'ー')
+    // カタカナ → ひらがな（半角カナは未対応のため対象外）
+    .replace(/[\u30A1-\u30F6]/g, s => String.fromCharCode(s.charCodeAt(0) - 0x60))
+    // 大文字 → 小文字
+    .toLowerCase()
+    .trim()
+}
+
+// =============================
+// ソート用の日付キー正規化
+//  - 形式混在（ISO / 時刻あり / 和暦原文 / 空）を数値(epoch)に統一
+//  - 不明・空は -Infinity を返して必ず末尾に回す
+// =============================
+function toSortKey(dateStr: string | undefined | null): number {
+  if (!dateStr) return -Infinity
+  // 和暦が残っている場合はISOへ変換
+  const iso = /令和|平成/.test(dateStr) ? wareki2iso(dateStr) : dateStr
+  const t = Date.parse(iso)
+  return isNaN(t) ? -Infinity : t
 }
 
 // 協会けんぽ 現在公開中の案件
@@ -1630,12 +1683,12 @@ function expandKeywords(query: string): string[] {
 function filterItemsByKeyword(items: any[], query: string, searchFields: string[], useSynonyms = false): any[] {
   if (!query) return items
 
-  // 検索対象テキストを取得するヘルパー
+  // 検索対象テキストを取得するヘルパー（共通正規化を適用：全角半角/大小文字/カナ/長音）
   const getTargetText = (item: any): string => {
     const targets: string[] = []
-    if (searchFields.includes('name')) targets.push((item.projectName || '').toLowerCase())
-    if (searchFields.includes('desc')) targets.push((item.projectDescription || '').toLowerCase())
-    if (searchFields.includes('org')) targets.push((item.organizationName || '').toLowerCase())
+    if (searchFields.includes('name')) targets.push(normalizeText(item.projectName || ''))
+    if (searchFields.includes('desc')) targets.push(normalizeText(item.projectDescription || ''))
+    if (searchFields.includes('org')) targets.push(normalizeText(item.organizationName || ''))
     return targets.join(' ')
   }
 
@@ -1647,13 +1700,15 @@ function filterItemsByKeyword(items: any[], query: string, searchFields: string[
 
     // いずれかのORグループにマッチすればOK
     return orGroups.some(group => {
-      // スペース区切りのANDキーワード
-      const andKeywords = group.toLowerCase().split(/[\s　]+/).filter(k => k.length > 0)
+      // スペース区切りのANDキーワード（クエリ側も同じ正規化を通す）
+      const andKeywords = group.split(/[\s　]+/)
+        .map(k => normalizeText(k))
+        .filter(k => k.length > 0)
 
-      // 類義語展開ONの場合: 各ANDキーワードの類義語をOR展開
+      // 類義語展開ONの場合: 各ANDキーワードの類義語をOR展開（類義語も正規化）
       if (useSynonyms) {
         return andKeywords.every(kw => {
-          const kwExpanded = expandWithSynonyms(kw).map(s => s.toLowerCase())
+          const kwExpanded = expandWithSynonyms(kw).map(s => normalizeText(s))
           return kwExpanded.some(syn => combined.includes(syn))
         })
       } else {
@@ -3931,12 +3986,24 @@ async function loadKyoukaikenpo() {
 // ========================
 // ソート
 // ========================
+// 日付文字列(ISO/時刻あり/和暦原文/空が混在)を数値化。不明・空は末尾へ。
+function dateSortKey(d) {
+  if (!d) return -Infinity;
+  let s = String(d);
+  // 和暦(令和/平成)が残っている場合はざっくりISO化
+  const reiwa = s.match(/令和\\s*(\\d{1,2})\\s*年\\s*(\\d{1,2})\\s*月\\s*(\\d{1,2})\\s*日/);
+  const heisei = s.match(/平成\\s*(\\d{1,2})\\s*年\\s*(\\d{1,2})\\s*月\\s*(\\d{1,2})\\s*日/);
+  if (reiwa)  s = (2018 + parseInt(reiwa[1]))  + '-' + reiwa[2].padStart(2,'0')  + '-' + reiwa[3].padStart(2,'0');
+  if (heisei) s = (1988 + parseInt(heisei[1])) + '-' + heisei[2].padStart(2,'0') + '-' + heisei[3].padStart(2,'0');
+  const t = Date.parse(s);
+  return isNaN(t) ? -Infinity : t;
+}
 function sortResults(type) {
   if (!searchResults.length) return;
   const sorted = [...searchResults].sort((a, b) => {
-    const dateA = type === 'date' ? (a.cftIssueDate || '') : (a.tenderSubmissionDeadline || '');
-    const dateB = type === 'date' ? (b.cftIssueDate || '') : (b.tenderSubmissionDeadline || '');
-    return dateB.localeCompare(dateA);
+    const dateA = type === 'date' ? a.cftIssueDate : a.tenderSubmissionDeadline;
+    const dateB = type === 'date' ? b.cftIssueDate : b.tenderSubmissionDeadline;
+    return dateSortKey(dateB) - dateSortKey(dateA);
   });
 
   const list = document.getElementById('result-list');
