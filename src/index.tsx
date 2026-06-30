@@ -1089,10 +1089,40 @@ app.get('/api/search-all', async (c) => {
   // 公告日降順でソート（形式混在を吸収し、日付不明は末尾へ）
   results.sort((a, b) => toSortKey(b.cftIssueDate) - toSortKey(a.cftIssueDate))
 
+  // 取得失敗の見える化：各ソースの取得ステータスを構造化して返す
+  //  ソースキー → 表示名
+  const SOURCE_LABELS: Record<string, string> = {
+    kkj: '官公需ポータル',
+    kyoukaikenpo: '協会けんぽ',
+    pfa: '企業年金連合会',
+    jeed: 'JEED（高齢・障害・求職者雇用支援機構）',
+    jfc: '日本政策金融公庫',
+    fsa: '金融庁',
+    uitec: 'UITEC（職業能力開発総合大学校）',
+    osaka: '大阪市デジタル統括室',
+    hokkaido: '北海道情報政策課',
+    imabari: '今治市産業振興課',
+    nagano: '長野県営業局',
+    ipa: 'IPA（情報処理推進機構）',
+    bosai: '防災科研',
+  }
+  const sourceStatus = sources
+    .map(s => s.trim())
+    .filter(s => s)
+    .map(s => ({
+      key: s,
+      label: SOURCE_LABELS[s] || s,
+      ok: !errors[s],
+      error: errors[s] || undefined,
+    }))
+  const failedSources = sourceStatus.filter(s => !s.ok).map(s => s.label)
+
   return c.json({
     totalHits: results.length,
     items: results,
     errors: Object.keys(errors).length > 0 ? errors : undefined,
+    sourceStatus,
+    failedSources: failedSources.length > 0 ? failedSources : undefined,
     expandedKeywords: useSynonyms && expandedKeywords.length > 1 ? expandedKeywords : undefined,
   })
 })
@@ -5145,8 +5175,11 @@ async function loadAll() {
     const res = await axios.get('/api/search-all', { params });
     const data = res.data;
 
+    // 取得ステータス警告HTML（取得失敗の見える化）
+    const statusWarnHtml = buildSourceStatusHtml(data);
+
     if (!data.items || data.items.length === 0) {
-      area.innerHTML = \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
+      area.innerHTML = statusWarnHtml + \`<div class="text-center py-16 bg-white rounded-2xl border border-gray-100">
         <i class="fas fa-search text-gray-300 text-4xl mb-4"></i>
         <p class="text-gray-500 text-lg">案件が見つかりませんでした</p>
         <p class="text-xs text-gray-400 mt-2">キーワードを変更するか、検索対象ソースを確認してください</p>
@@ -5198,9 +5231,7 @@ async function loadAll() {
             </span>
           </h3>
           \${summaryHtml}
-          \${data.errors ? \`<div class="text-xs text-orange-600 bg-orange-50 border border-orange-200 rounded-lg px-3 py-2">
-            <i class="fas fa-exclamation-circle mr-1"></i>一部ソースで取得エラーが発生しました（取得できたデータのみ表示しています）
-          </div>\` : ''}
+          \${statusWarnHtml}
         </div>
         <div id="result-list" class="divide-y divide-gray-50">
     \`;
@@ -5408,6 +5439,39 @@ function isItemClosed(item) {
 function escHtml(str) {
   if (!str) return '';
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// 取得失敗の見える化：一括検索のソース別取得ステータスを表示するHTMLを生成
+function buildSourceStatusHtml(data) {
+  const status = Array.isArray(data && data.sourceStatus) ? data.sourceStatus : [];
+  if (status.length === 0) return '';
+
+  const failed = status.filter(s => !s.ok);
+  const okCount = status.length - failed.length;
+
+  if (failed.length === 0) {
+    // 全ソース正常
+    return \`<div class="text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2 flex items-center gap-1.5">
+      <i class="fas fa-check-circle"></i>
+      <span>全 \${status.length} ソースから正常に取得しました</span>
+    </div>\`;
+  }
+
+  // 一部失敗あり
+  const failedTags = failed.map(s =>
+    \`<span class="tag border border-red-200 bg-red-50 text-red-700 px-2 py-0.5 text-xs">\${escHtml(s.label)}</span>\`
+  ).join(' ');
+
+  return \`<div class="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2.5">
+    <div class="flex items-center gap-1.5 font-semibold mb-1.5">
+      <i class="fas fa-exclamation-triangle"></i>
+      <span>\${failed.length} 件のソースで取得に失敗しました（正常: \${okCount} / 全 \${status.length}）</span>
+    </div>
+    <div class="flex flex-wrap gap-1 mb-1.5">\${failedTags}</div>
+    <p class="text-red-600 leading-relaxed">
+      <i class="fas fa-info-circle mr-1"></i>失敗したソースの案件は表示されていません。取りこぼしを避けるため、上記機関は公式サイトを直接ご確認ください。
+    </p>
+  </div>\`;
 }
 
 // Enterキーで検索
