@@ -5735,7 +5735,8 @@ function buildEmailHtml(keyword: string, items: any[]): string {
 </html>`
 }
 
-// 通知チェック本体ロジック
+// 通知チェック本体ロジック（メール通知は「動画案件」専用）
+//  NOTIFY_KEYWORDS は後方互換のため受け取るが、動画判定には使用しない
 async function runNotifyCheck(env: {
   RESEND_API_KEY?: string
   NOTIFY_EMAILS?: string
@@ -5745,10 +5746,14 @@ async function runNotifyCheck(env: {
   newItems: Record<string, any[]>
   sent: Record<string, boolean>
   errors: string[]
+  filterStats?: Record<string, { matched: number; open: number; fresh: number }>
 }> {
   const apiKey = env.RESEND_API_KEY || ''
   const emails = (env.NOTIFY_EMAILS || '').split(',').map(s => s.trim()).filter(Boolean)
-  const keywords = (env.NOTIFY_KEYWORDS || '動画制作,研修').split(',').map(s => s.trim()).filter(Boolean)
+
+  // メール通知は「動画案件」専用。KKJは「動画」「映像」で取りこぼし防止のOR取得。
+  //  （NOTIFY_KEYWORDS は動画検出には使わず、関連度は scoreVideoItem で判定する）
+  const VIDEO_FETCH_KEYWORDS = ['動画', '映像']
 
   const errors: string[] = []
   const newItems: Record<string, any[]> = {}
@@ -5758,10 +5763,10 @@ async function runNotifyCheck(env: {
   // 全ソースから全案件を取得
   const allItems: any[] = []
 
-  // 官公需ポータル（キーワードごとに検索）
-  for (const kw of keywords) {
+  // 官公需ポータル（動画/映像でOR取得）
+  for (const kw of VIDEO_FETCH_KEYWORDS) {
     try {
-      const params = new URLSearchParams({ Query: kw, Count: '50' })
+      const params = new URLSearchParams({ Query: kw, Count: '100' })
       const res = await fetch(`http://www.kkj.go.jp/api/?${params.toString()}`, {
         headers: { 'User-Agent': 'BidSearchApp/1.0' }
       })
@@ -5769,7 +5774,6 @@ async function runNotifyCheck(env: {
       const parsed = parseKkjXml(xml)
       ;(parsed.items || []).forEach((item: any) => {
         item.source = '官公需ポータル'
-        item._matchKeyword = kw
         allItems.push(item)
       })
       totalChecked += parsed.totalHits || 0
@@ -6039,48 +6043,75 @@ async function runNotifyCheck(env: {
     return true
   }
 
-  // キーワードフィルタリング & 締切判定 & 新着判定（案件名＋説明文＋機関名）
+  // 公示日が「3か月以内」かどうか（過去3か月より古い案件は通知対象外）
+  //  プロポーザルも通知対象に含めるため、手続種別での除外はしない（scoreVideoItemは
+  //  プロポを減点するが除外はしないので、score>0であれば動画案件として通知する）
+  function isWithin3Months(item: any): boolean {
+    const issueStr: string = item.cftIssueDate || item.date || ''
+    if (!issueStr) return false // 公示日不明は対象外（古い案件の混入を防ぐ）
+    const issueDate = new Date(issueStr)
+    if (isNaN(issueDate.getTime())) return false
+    const threshold = new Date()
+    threshold.setHours(0, 0, 0, 0)
+    threshold.setMonth(threshold.getMonth() - 3) // 3か月前
+    // 未来日（誤記）も許容しつつ、3か月より前は除外
+    return issueDate >= threshold
+  }
+
+  // 動画案件の抽出（プロポーザル含む）＋ 3か月以内 ＋ 募集中 ＋ 新着判定
+  const NOTIFY_VIDEO_KEY = '動画'
   const filterStats: Record<string, { matched: number; open: number; fresh: number }> = {}
 
-  for (const kw of keywords) {
-    const matched = allItems.filter(item =>
-      (item.projectName || '').includes(kw) ||
-      (item.projectDescription || '').includes(kw) ||
-      (item.organizationName || '').includes(kw)
-    )
-
-    // 募集終了済みを除外
-    const openItems = matched.filter(isStillOpen)
-
-    const seenIds = getSeenIds(kw)
-    const freshItems = openItems.filter(item => {
-      const id = item.resultId || item.url || item.projectName || ''
-      return id && !seenIds.has(id)
-    })
-
-    filterStats[kw] = { matched: matched.length, open: openItems.length, fresh: freshItems.length }
-    newItems[kw] = freshItems
-
-    // 既出IDを更新（openItemsベースで記録）
-    openItems.forEach(item => {
-      const id = item.resultId || item.url || item.projectName || ''
-      if (id) seenIds.add(id)
-    })
+  // 重複除去（KKJのOR取得や複数ソースで同一案件が重複しうる）
+  const dedup = new Map<string, any>()
+  for (const item of allItems) {
+    const id = item.resultId || item.url || item.projectName || ''
+    if (!id) continue
+    if (!dedup.has(id)) dedup.set(id, item)
   }
+  const uniqueItems = [...dedup.values()]
+
+  // 動画案件のみ（scoreVideoItem で関連度判定。プロポも score>0 なら含む）
+  const videoMatched = uniqueItems
+    .map(item => ({ item, ...scoreVideoItem(item) }))
+    .filter(x => x.isVideo)
+    .map(x => { x.item._videoScore = x.score; return x.item })
+
+  // 過去3か月より古い案件を除外
+  const recentItems = videoMatched.filter(isWithin3Months)
+
+  // 募集終了済みを除外（募集中のみ通知）
+  const openItems = recentItems.filter(isStillOpen)
+
+  // スコア降順（関連度の高い順）に並べてから新着判定
+  openItems.sort((a, b) => (b._videoScore || 0) - (a._videoScore || 0))
+
+  const seenIds = getSeenIds(NOTIFY_VIDEO_KEY)
+  const freshItems = openItems.filter(item => {
+    const id = item.resultId || item.url || item.projectName || ''
+    return id && !seenIds.has(id)
+  })
+
+  filterStats[NOTIFY_VIDEO_KEY] = { matched: videoMatched.length, open: openItems.length, fresh: freshItems.length }
+  newItems[NOTIFY_VIDEO_KEY] = freshItems
+
+  // 既出IDを更新（openItemsベースで記録：再通知防止）
+  openItems.forEach(item => {
+    const id = item.resultId || item.url || item.projectName || ''
+    if (id) seenIds.add(id)
+  })
 
   // メール送信（新着がある場合のみ）
   if (apiKey && emails.length > 0) {
-    for (const kw of keywords) {
-      const items = newItems[kw] || []
-      if (items.length === 0) {
-        sent[kw] = false
-        continue
-      }
-      const subject = `【入札DX】「${kw}」新着案件 ${items.length}件`
-      const html = buildEmailHtml(kw, items)
+    const items = newItems[NOTIFY_VIDEO_KEY] || []
+    if (items.length === 0) {
+      sent[NOTIFY_VIDEO_KEY] = false
+    } else {
+      const subject = `【入札DX】動画制作 新着案件 ${items.length}件`
+      const html = buildEmailHtml('動画制作', items)
       const result = await sendEmailViaResend(apiKey, emails, subject, html)
-      sent[kw] = result.ok
-      if (!result.ok) errors.push(`メール送信[${kw}]: ${result.error}`)
+      sent[NOTIFY_VIDEO_KEY] = result.ok
+      if (!result.ok) errors.push(`メール送信[動画]: ${result.error}`)
     }
   }
 
@@ -6127,15 +6158,17 @@ app.get('/api/notify-check', async (c) => {
 app.get('/api/notify-status', async (c) => {
   const apiKey = c.env.RESEND_API_KEY || ''
   const emails = c.env.NOTIFY_EMAILS || ''
-  const keywords = c.env.NOTIFY_KEYWORDS || ''
 
   return c.json({
     resendConfigured: !!apiKey,
     notifyEmails: emails ? emails.split(',').map(s => s.trim()) : [],
-    notifyKeywords: keywords ? keywords.split(',').map(s => s.trim()) : [],
+    // メール通知は「動画案件」専用に固定（関連度スコアで判定／プロポーザルも含む）
+    notifyKeywords: ['動画制作（自動判定・プロポーザル含む）'],
+    notifyMode: 'video-only',
+    notifyMaxAgeMonths: 3,
     schedule: '毎日 11:00 (JST)',
     lastCheck: '未実施（初回チェック前）',
-    version: 'acc9c94',
+    version: 'video-notify-v1',
     closedBidFilter: true,
   })
 })
