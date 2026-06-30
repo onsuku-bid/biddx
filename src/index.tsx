@@ -450,65 +450,81 @@ app.get('/api/nagano', async (c) => {
 
 function scrapeJeed(html: string): any[] {
   const items: any[] = []
-  // ul.nyusatsuの中のliを抽出
-  const ulRegex = /<ul class="nyusatsu">([\s\S]*?)<\/ul>/gi
-  let ulMatch
-  while ((ulMatch = ulRegex.exec(html)) !== null) {
-    const ulHtml = ulMatch[1]
-    const liRegex = /<li[^>]*>([\s\S]*?)<\/li>/gi
-    let liMatch
-    while ((liMatch = liRegex.exec(ulHtml)) !== null) {
-      const liHtml = liMatch[1]
+  const seen = new Set<string>()
 
-      // 日付 (.date)
-      const dateMatch = liHtml.match(/<div class="date"[^>]*>([\s\S]*?)<\/div>/i)
-      const dateRaw = dateMatch ? dateMatch[1].replace(/<[^>]+>/g, '').trim() : ''
-      const cftIssueDate = wareki2iso(dateRaw)
+  // JEEDの入札一覧は ul.nyusatsu 内にあるが、各案件liは shiryou 内に入れ子の <ul><li> を含む。
+  //  そのため ul.nyusatsu / li を非貪欲マッチで区切ると入れ子の </ul></li> で切れ、案件を取りこぼす。
+  //  最初の ul.nyusatsu の開始位置からフッター手前までを対象に、div.title>a を全件抽出する方式に変更。
+  const startIdx = html.search(/<ul class="nyusatsu">/i)
+  if (startIdx < 0) return items
+  // フッター以降は対象外（footer-nav 等の無関係リンクを拾わないため）
+  const footerIdx = html.search(/<(footer|div[^>]*class="[^"]*footer)/i)
+  const combined = html.slice(startIdx, footerIdx > startIdx ? footerIdx : undefined)
 
-      // 案件名 (.title a)
-      const titleMatch = liHtml.match(/<div class="title"[^>]*>[\s\S]*?<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i)
-      if (!titleMatch) continue
-      let pdfUrl = titleMatch[1]
-      // 相対URLを絶対URLに変換
-      if (pdfUrl.startsWith('/')) pdfUrl = 'https://www.jeed.go.jp' + pdfUrl
-      const projectName = titleMatch[2].replace(/<[^>]+>/g, '').trim()
-        .replace(/（PDF[^）]*）/g, '').trim()
-      if (!projectName) continue
+  // 各案件は <div class="date">...（任意）...<div class="title">...<a> で始まる。
+  // タイトルdivの出現位置で区切ってブロック分割する。
+  const titleAnchorRegex = /<div class="title"[^>]*>[\s\S]*?<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi
+  const blocks: { start: number; pdfUrl: string; rawName: string }[] = []
+  let tMatch
+  while ((tMatch = titleAnchorRegex.exec(combined)) !== null) {
+    blocks.push({ start: tMatch.index, pdfUrl: tMatch[1], rawName: tMatch[2] })
+  }
 
-      // 締切日（.bikou 内の「終了：」）
-      const bikouMatch = liHtml.match(/終了：([^<\n]+)/)
-      const deadlineRaw = bikouMatch ? bikouMatch[1].trim() : ''
-      const tenderDeadline = wareki2iso(deadlineRaw)
+  for (let i = 0; i < blocks.length; i++) {
+    const blk = blocks[i]
+    // このブロックの範囲: 直前ブロックの終端〜次ブロック開始（日付は title の手前にあるため範囲を少し前へ広げる）
+    const segStart = i === 0 ? 0 : blocks[i - 1].start
+    const segEnd = i + 1 < blocks.length ? blocks[i + 1].start : combined.length
+    const seg = combined.slice(segStart, segEnd)
 
-      // 添付ファイル（.shiryou内のリンク）
-      const attachments: any[] = []
+    let pdfUrl = blk.pdfUrl
+    if (pdfUrl.startsWith('/')) pdfUrl = 'https://www.jeed.go.jp' + pdfUrl
+    const projectName = blk.rawName.replace(/<[^>]+>/g, '').trim()
+      .replace(/（PDF[^）]*）/g, '').replace(/\(PDF[^)]*\)/gi, '').trim()
+    if (!projectName) continue
+
+    // 公告日：このブロックに最も近い直前の date div を採用
+    const beforeTitle = combined.slice(segStart, blk.start)
+    const dateMatches = [...beforeTitle.matchAll(/<div class="date"[^>]*>([\s\S]*?)<\/div>/gi)]
+    const dateRaw = dateMatches.length > 0
+      ? dateMatches[dateMatches.length - 1][1].replace(/<[^>]+>/g, '').trim()
+      : ''
+    const cftIssueDate = wareki2iso(dateRaw)
+
+    // 締切日（「終了：」表記があれば）
+    const bikouMatch = seg.match(/終了：([^<\n]+)/)
+    const tenderDeadline = bikouMatch ? wareki2iso(bikouMatch[1].trim()) : ''
+
+    // 添付ファイル（.shiryou内のリンク）
+    const attachments: any[] = []
+    const shiryouMatch = seg.match(/<div class="shiryou">([\s\S]*?)<\/div>/i)
+    if (shiryouMatch) {
       const attachRegex = /<a[^>]+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi
       let attachMatch
-      const shiryouMatch = liHtml.match(/<div class="shiryou">([\s\S]*?)<\/div>/i)
-      if (shiryouMatch) {
-        while ((attachMatch = attachRegex.exec(shiryouMatch[1])) !== null) {
-          let aUrl = attachMatch[1]
-          if (aUrl.startsWith('/')) aUrl = 'https://www.jeed.go.jp' + aUrl
-          const aName = attachMatch[2].replace(/<[^>]+>/g, '').trim()
-          if (aName) attachments.push({ name: aName, url: aUrl })
-        }
+      while ((attachMatch = attachRegex.exec(shiryouMatch[1])) !== null) {
+        let aUrl = attachMatch[1]
+        if (aUrl.startsWith('/')) aUrl = 'https://www.jeed.go.jp' + aUrl
+        const aName = attachMatch[2].replace(/<[^>]+>/g, '').trim()
+        if (aName) attachments.push({ name: aName, url: aUrl })
       }
-
-      const resultId = `jeed-${cftIssueDate}-${projectName.slice(0, 20)}`
-      items.push({
-        resultId,
-        source: 'jeed',
-        organizationName: '独立行政法人高齢・障害・求職者雇用支援機構',
-        projectName,
-        procedureType: '一般競争入札',
-        cftIssueDate,
-        tenderDeadline,
-        url: pdfUrl,
-        prefectureName: '東京都',
-        category: '役務',
-        attachments,
-      })
     }
+
+    const resultId = `jeed-${cftIssueDate}-${projectName.slice(0, 24)}`
+    if (seen.has(resultId)) continue
+    seen.add(resultId)
+    items.push({
+      resultId,
+      source: 'jeed',
+      organizationName: '独立行政法人高齢・障害・求職者雇用支援機構',
+      projectName,
+      procedureType: '一般競争入札',
+      cftIssueDate,
+      tenderDeadline,
+      url: pdfUrl,
+      prefectureName: '東京都',
+      category: '役務',
+      attachments,
+    })
   }
   return items
 }
@@ -912,7 +928,7 @@ app.get('/api/search-all', async (c) => {
           headers: { 'User-Agent': 'BidSearchApp/1.0' }
         })
         const html = await res.text()
-        const items = scrapeKyoukaikenpo(html, 'https://www.kyoukaikenpo.or.jp/disclosure/procurement/')
+        const items = parseKyoukaikenpoHtml(html, '協会けんぽ (公開中)')
         const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['kyoukaikenpo'] = String(e) }
