@@ -728,6 +728,130 @@ function scrapeJfc(html: string): any[] {
   return items
 }
 
+// =============================================================================
+// 調達ポータル（p-portal.go.jp）— 全省庁の調達情報が集約される国の公式窓口
+//  JavaScript/POSTベースの検索画面のため、以下の手順でサーバー側から取得する：
+//   1) 検索画面GET → セッションCookie + CSRFトークンを取得
+//   2) 案件名キーワードをPOST送信 → 結果ページへ302リダイレクト
+//   3) 結果ページHTMLのテーブルから案件名・機関名・案件番号・詳細リンクをパース
+//  ※ Cloudflare Workers の fetch は Cookie を自動管理しないため、手動で受け渡す。
+// =============================================================================
+const PPORTAL_BASE = 'https://www.p-portal.go.jp/pps-web-biz'
+const PPORTAL_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) BidSearchApp/1.0'
+
+// Set-Cookie ヘッダ群を { name: value } の Cookie jar にマージ
+function pportalMergeCookies(jar: Record<string, string>, headers: Headers): void {
+  // Workers / 近年の Node は getSetCookie() を実装
+  const anyHeaders = headers as any
+  let raw: string[] = []
+  if (typeof anyHeaders.getSetCookie === 'function') {
+    raw = anyHeaders.getSetCookie()
+  } else {
+    const single = headers.get('set-cookie')
+    if (single) raw = [single]
+  }
+  for (const c of raw) {
+    const m = c.match(/^([^=]+)=([^;]*)/)
+    if (m) jar[m[1].trim()] = m[2]
+  }
+}
+function pportalCookieHeader(jar: Record<string, string>): string {
+  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ')
+}
+
+// 結果ページHTMLを案件配列にパース
+function parsePportalList(html: string): any[] {
+  const items: any[] = []
+  const strip = (s: string) => s
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .trim()
+  const art = [...html.matchAll(/id="[^"]*\/articleNm"[^>]*>([\s\S]*?)<\/td>/gi)].map(m => strip(m[1]))
+  const org = [...html.matchAll(/id="[^"]*\/procurementOrgan"[^>]*>([\s\S]*?)<\/td>/gi)].map(m => strip(m[1]))
+  const no = [...html.matchAll(/id="[^"]*\/procurementItemNo"[^>]*>([\s\S]*?)<\/td>/gi)].map(m => strip(m[1]))
+  const ids = [...html.matchAll(/procurementItemInfoId',\s*value:\s*'(\d+)'/g)].map(m => m[1])
+  const seen = new Set<string>()
+  for (let i = 0; i < art.length; i++) {
+    const projectName = art[i]
+    if (!projectName) continue
+    const detailId = ids[i] || ''
+    const itemNo = (no[i] || '').replace(/^0+/, '') // 先頭0を除去した表示用番号
+    const url = detailId
+      ? `${PPORTAL_BASE}/UAA01/OAA0104?procurementItemInfoId=${detailId}&SyFromFlg=1`
+      : `${PPORTAL_BASE}/UAA01/OAA0101`
+    const resultId = `pportal-${no[i] || detailId || projectName.slice(0, 16)}`
+    if (seen.has(resultId)) continue
+    seen.add(resultId)
+    items.push({
+      resultId,
+      source: 'pportal',
+      organizationName: org[i] || '省庁等',
+      projectName,
+      procedureType: '一般競争入札',
+      cftIssueDate: '',
+      tenderDeadline: '',
+      url,
+      prefectureName: '',
+      category: '役務',
+      procurementItemNo: itemNo,
+    })
+  }
+  return items
+}
+
+// 調達ポータルを1キーワードで検索（CSRF/Cookieハンドシェイク込み）
+async function scrapePportal(keyword: string): Promise<any[]> {
+  const jar: Record<string, string> = {}
+  // 1) 検索画面GET（302 → OAA0101）。Cookie取得。
+  const r1 = await fetch(`${PPORTAL_BASE}/UAA01/OAA0100?OAA0115`, {
+    headers: { 'User-Agent': PPORTAL_UA },
+    redirect: 'manual',
+  })
+  pportalMergeCookies(jar, r1.headers)
+  let searchUrl = `${PPORTAL_BASE}/UAA01/OAA0101`
+  const loc1 = r1.headers.get('location')
+  if (loc1) searchUrl = loc1.startsWith('http') ? loc1 : `https://www.p-portal.go.jp${loc1}`
+
+  // 2) 検索画面本体GET → CSRFトークン取得
+  const r2 = await fetch(searchUrl, {
+    headers: { 'User-Agent': PPORTAL_UA, 'Cookie': pportalCookieHeader(jar) },
+  })
+  pportalMergeCookies(jar, r2.headers)
+  const html2 = await r2.text()
+  const csrfM = html2.match(/name="_csrf"\s+value="([^"]+)"/)
+  if (!csrfM) throw new Error('CSRFトークンを取得できませんでした')
+  const csrf = csrfM[1]
+
+  // 3) 検索POST（案件名キーワード）→ 結果ページへ302
+  const body = new URLSearchParams()
+  body.set('_csrf', csrf)
+  body.set('searchConditionBean.articleNm', keyword)
+  body.set('searchConditionBean.caseDivision', '0')
+  body.set('OAA0102', '')
+  const r3 = await fetch(`${PPORTAL_BASE}/UAA01/OAA0100`, {
+    method: 'POST',
+    headers: {
+      'User-Agent': PPORTAL_UA,
+      'Cookie': pportalCookieHeader(jar),
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Referer': searchUrl,
+    },
+    body: body.toString(),
+    redirect: 'manual',
+  })
+  pportalMergeCookies(jar, r3.headers)
+  let resultUrl = r3.headers.get('location')
+  if (!resultUrl) throw new Error(`検索POST後のリダイレクトがありません (status ${r3.status})`)
+  if (!resultUrl.startsWith('http')) resultUrl = `https://www.p-portal.go.jp${resultUrl}`
+
+  // 4) 結果ページGET → パース
+  const r4 = await fetch(resultUrl, {
+    headers: { 'User-Agent': PPORTAL_UA, 'Cookie': pportalCookieHeader(jar), 'Referer': searchUrl },
+  })
+  const html = await r4.text()
+  return parsePportalList(html)
+}
+
 app.get('/api/jfc', async (c) => {
   const keyword = c.req.query('keyword') || c.req.query('query') || ''
   const searchFields = (c.req.query('searchFields') || 'name').split(',')
@@ -740,6 +864,38 @@ app.get('/api/jfc', async (c) => {
     let items = scrapeJfc(html)
     if (keyword) items = filterItemsByKeyword(items, keyword, searchFields)
     return c.json({ source: '株式会社日本政策金融公庫', totalHits: items.length, items })
+  } catch (e) {
+    return c.json({ error: String(e) }, 500)
+  }
+})
+
+// =============================
+// 調達ポータル（p-portal.go.jp）スクレイピングAPI（全省庁）
+//  キーワード未指定時は '入札' で広めに取得。複数語はカンマ区切りでOR取得。
+// =============================
+app.get('/api/pportal', async (c) => {
+  const keyword = c.req.query('keyword') || c.req.query('query') || ''
+  const searchFields = (c.req.query('searchFields') || 'name').split(',')
+  try {
+    // 調達ポータルは「案件名」での絞り込み検索。キーワードを分割してOR取得。
+    const queries = keyword
+      ? keyword.split(/[,，、]/).map(k => k.trim()).filter(Boolean)
+      : ['入札']
+    const merged: any[] = []
+    const seen = new Set<string>()
+    for (const q of queries) {
+      try {
+        const part = await scrapePportal(q)
+        for (const it of part) {
+          if (seen.has(it.resultId)) continue
+          seen.add(it.resultId)
+          merged.push(it)
+        }
+      } catch (_) { /* 個別クエリ失敗は無視して継続 */ }
+    }
+    // 取得結果はサーバー側でキーワード未指定の場合そのまま、指定時は最終フィルタ
+    let items = keyword ? filterItemsByKeyword(merged, keyword, searchFields) : merged
+    return c.json({ source: '調達ポータル（全省庁）', totalHits: items.length, items })
   } catch (e) {
     return c.json({ error: String(e) }, 500)
   }
@@ -870,7 +1026,7 @@ function convertJapaneseDate(dateStr: string): string {
 
 app.get('/api/search-all', async (c) => {
   const keyword = c.req.query('keyword') || ''
-  const sources = (c.req.query('sources') || 'kkj,kyoukaikenpo,pfa,jeed,jfc').split(',')
+  const sources = (c.req.query('sources') || 'kkj,pportal,kyoukaikenpo,pfa,jeed,jfc').split(',')
   const searchFields = (c.req.query('searchFields') || 'name').split(',')
   const useSynonyms = c.req.query('synonyms') === '1'
 
@@ -971,6 +1127,30 @@ app.get('/api/search-all', async (c) => {
         const filtered = keyword ? filterItemsByKeyword(items, keyword, searchFields, useSynonyms) : items
         results.push(...filtered)
       } catch(e) { errors['jfc'] = String(e) }
+    })() : Promise.resolve(),
+
+    // 調達ポータル（全省庁：文科省・農水省・内閣府・総務省・国交省 等）
+    //  案件名でキーワード／類義語展開語をOR取得（CSRF/Cookieハンドシェイク込み）
+    sources.includes('pportal') ? (async () => {
+      try {
+        // 検索語：キーワード指定時は展開語、未指定時は広く '入札'
+        const ppQueries = expandedKeywords.length > 0 ? expandedKeywords : ['入札']
+        const merged: any[] = []
+        const seen = new Set<string>()
+        // 調達ポータルはセッション/CSRFを共有しづらいため各語を直列取得（過負荷防止）
+        for (const q of ppQueries) {
+          try {
+            const part = await scrapePportal(q)
+            for (const it of part) {
+              if (seen.has(it.resultId)) continue
+              seen.add(it.resultId)
+              merged.push(it)
+            }
+          } catch (_) { /* 個別クエリ失敗は継続 */ }
+        }
+        const filtered = keyword ? filterItemsByKeyword(merged, keyword, searchFields, useSynonyms) : merged
+        results.push(...filtered)
+      } catch(e) { errors['pportal'] = String(e) }
     })() : Promise.resolve(),
 
     // 金融庁
@@ -1093,6 +1273,7 @@ app.get('/api/search-all', async (c) => {
   //  ソースキー → 表示名
   const SOURCE_LABELS: Record<string, string> = {
     kkj: '官公需ポータル',
+    pportal: '調達ポータル（全省庁）',
     kyoukaikenpo: '協会けんぽ',
     pfa: '企業年金連合会',
     jeed: 'JEED（高齢・障害・求職者雇用支援機構）',
@@ -3349,6 +3530,9 @@ function renderHTML(): string {
                 <input type="checkbox" id="src-kkj" checked class="rounded text-indigo-600"> 官公需ポータル
               </label>
               <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input type="checkbox" id="src-pportal" checked class="rounded text-purple-600"> 調達ポータル(全省庁)
+              </label>
+              <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
                 <input type="checkbox" id="src-kkp" checked class="rounded text-rose-600"> 協会けんぽ
               </label>
               <label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
@@ -5119,6 +5303,7 @@ async function loadAll() {
   const area = document.getElementById('all-result-area');
   const query = document.getElementById('all-query').value.trim();
   const useSrcKkj = document.getElementById('src-kkj').checked;
+  const useSrcPportal = document.getElementById('src-pportal').checked;
   const useSrcKkp = document.getElementById('src-kkp').checked;
   const useSrcPfa = document.getElementById('src-pfa').checked;
   const useSrcJeed = document.getElementById('src-jeed').checked;
@@ -5132,7 +5317,7 @@ async function loadAll() {
   const useSrcIpa = document.getElementById('src-ipa').checked;
   const useSrcBosai = document.getElementById('src-bosai').checked;
 
-  if (!useSrcKkj && !useSrcKkp && !useSrcPfa && !useSrcJeed && !useSrcJfc && !useSrcFsa && !useSrcUitec && !useSrcOsaka && !useSrcHokkaido && !useSrcImabari && !useSrcNagano && !useSrcIpa && !useSrcBosai) {
+  if (!useSrcKkj && !useSrcPportal && !useSrcKkp && !useSrcPfa && !useSrcJeed && !useSrcJfc && !useSrcFsa && !useSrcUitec && !useSrcOsaka && !useSrcHokkaido && !useSrcImabari && !useSrcNagano && !useSrcIpa && !useSrcBosai) {
     area.innerHTML = \`<div class="text-center py-8 bg-white rounded-2xl border border-gray-100">
       <p class="text-gray-500">検索対象ソースを1つ以上選択してください</p>
     </div>\`;
@@ -5144,6 +5329,7 @@ async function loadAll() {
   try {
     const sources = [];
     if (useSrcKkj) sources.push('kkj');
+    if (useSrcPportal) sources.push('pportal');
     if (useSrcKkp) sources.push('kyoukaikenpo');
     if (useSrcPfa) sources.push('pfa');
     if (useSrcJeed) sources.push('jeed');
@@ -5832,6 +6018,17 @@ async function runNotifyCheck(env: {
     totalChecked += items.length
   } catch (e) {
     errors.push(`JFC: ${String(e)}`)
+  }
+
+  // 調達ポータル（全省庁）— 動画/映像で案件名OR取得（CSRF/Cookieハンドシェイク込み）
+  for (const kw of VIDEO_FETCH_KEYWORDS) {
+    try {
+      const items = await scrapePportal(kw)
+      items.forEach((item: any) => allItems.push(item))
+      totalChecked += items.length
+    } catch (e) {
+      errors.push(`調達ポータル[${kw}]: ${String(e)}`)
+    }
   }
 
   // 金融庁
